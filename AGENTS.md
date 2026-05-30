@@ -24,11 +24,16 @@ When a skill is triggered (see Triggers below), read and apply the referenced `.
 
 ## Project Context
 
-DoraPilot is a next-generation ADAS stack built on **dora-rs** (Dataflow-Oriented Robotic Architecture), succeeding VisionPilot's ROS2-based architecture. Target hardware: ExoPilot 03/03H (RK3688, 12 TOPS NPU, LiDAR-enabled).
+DoraPilot is a next-generation ADAS stack built on **dora-rs**, succeeding VisionPilot's ROS2-based architecture. Target hardware: ExoPilot 03/03H (RK3688, 12 TOPS NPU, LiDAR-enabled).
+
+**Philosophy:** Best of both worlds
+- **Autoware** → directory structure (`sensing/`, `perception/`, `planning/`, `control/`)
+- **VisionPilot** → ADAS logic, NPU models, vehicle integration
+- **dora-rs** → zero-copy IPC, declarative dataflows, fault tolerance
 
 **Key architectural difference from VisionPilot:**
-- VisionPilot: ROS2 Humble, ~150 packages, DDS pub/sub, Python launch files
-- DoraPilot: dora-rs 1.0, ~60 packages, Zenoh SHM zero-copy, declarative YAML dataflows
+- VisionPilot: ROS2 Humble, ~150 packages, DDS pub/sub, `evp_msgs` (requires `rosidl` build)
+- DoraPilot: dora-rs 1.0, ~40 Python modules, Zenoh SHM zero-copy, `drp_msgs` (pure Python, zero compilation)
 
 **Critical design rule:** DORA-native for data-heavy pipelines (camera, LiDAR, perception, planning). ROS2 bridge ONLY at boundaries (vehicle CAN, voice, navigation, dashboard).
 
@@ -46,31 +51,47 @@ DoraPilot is a next-generation ADAS stack built on **dora-rs** (Dataflow-Oriente
 ### Node Implementation (Python)
 ```python
 from dora import Node
-import pyarrow as pa
+from drp_msgs import PerceptionContext  # Use drp_msgs, never ROS2 msgs
+from drp_msgs.utils import to_arrow, from_arrow
 
 class MyNode:
-    def on_event(self, dora_event, send_output):
-        if dora_event["type"] == "INPUT":
-            value = dora_event["value"]
-            # process...
-            send_output("output_name", pa.array(result))
-        return DoraStatus.CONTINUE
+    def __init__(self):
+        self.node = Node()
+
+    def run(self):
+        for event in self.node:
+            if event["type"] == "INPUT":
+                msg = from_arrow(event["value"], PerceptionContext)
+                result = self.process(msg)
+                self.node.send_output("output", to_arrow(result))
+            elif event["type"] == "STOP":
+                break
 ```
 
 ### Operator Implementation (Python)
 ```python
-# Operators run in-process — keep them lightweight and stateless
-class MyOperator:
+from dora import DoraStatus
+from drp_msgs import PointCloud2
+from drp_msgs.utils import to_arrow, from_arrow
+
+class Operator:
+    def on_event(self, dora_event, send_output):
+        if dora_event["type"] == "INPUT":
+            return self.on_input(dora_event, send_output)
+        return DoraStatus.CONTINUE
+
     def on_input(self, dora_input, send_output):
-        value = dora_input["value"]
-        result = self.transform(value)
-        send_output("output_name", pa.array(result))
+        msg = from_arrow(dora_input["value"], PointCloud2)
+        result = self.process(msg)
+        send_output("filtered", to_arrow(result))
+        return DoraStatus.CONTINUE
 ```
 
-### Topic/Dataflow Path Mapping
-- VisionPilot used `/<layer>/<package>/<data>`
-- DoraPilot uses `<node_id>/<output_id>` within dataflows
-- Bridge to ROS2 topics ONLY at `vehicle_bridge` and `ros2_bridge` nodes
+### drp_msgs Rules
+- **Always use `from_arrow()` / `to_arrow()`** for serialization — never manual JSON
+- **Never import ROS2 messages** in DORA-native nodes (`sensor_msgs`, `std_msgs`, `evp_msgs`)
+- **Add new messages to `src/drp_msgs/`** as Python dataclasses, not `.msg` files
+- **Bridge nodes only** (in `vehicle_bridge/`) may convert drp_msgs to ROS2 dicts for the bridge
 
 ---
 
@@ -102,7 +123,8 @@ L1 THIRD_PARTY ──► rknpu2, hef_rt, rockchip_rga, mpp
 | Element | Format | Example |
 |---------|--------|---------|
 | Dataflow file | `dorapilot_<purpose>.yml` | `dorapilot_main.yml` |
-| Node package | `src/<layer>/<name>_node/` | `src/perception/driving_vision_node/` |
+| Node package | `src/<layer>/<name>/` | `src/perception/driving_vision/` |
+| Node script | `<name>_node.py` | `driving_vision_node.py` |
 | Operator file | `src/<layer>/operators/<name>.py` | `src/sensing/operators/image_preprocess.py` |
 | Daemon package | `src/system/<name>_daemon/` | `src/system/inference_daemon/` |
 | Node class | `PascalCase` + `Node` | `DrivingVisionNode` |
@@ -202,4 +224,4 @@ dora topic echo perception/context
 
 ---
 
-*AGENTS.md v1.0 — 2026-05-30*
+*AGENTS.md v2.0 — 2026-05-30*
