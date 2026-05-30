@@ -1,0 +1,231 @@
+# DoraPilot Main Dataflow — Hybrid Autoware + VisionPilot Architecture
+# ALL nodes are Python. No C++ nodes, no CMake.
+#
+# For Autoware developers:
+#   - Directory structure follows autoware.universe (sensing/perception/planning/control)
+#   - Messages use drp_msgs (ROS2-compatible pure Python)
+#   - Dataflow patterns adapted from autoware.universe DORA port
+#
+# For VisionPilot developers:
+#   - Node logic preserved (driving_vision, driving_policy, behavior_planner)
+#   - ACADOS MPC trajectory planner preserved
+#   - PID controller preserved
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SENSING (from autoware.universe patterns, adapted for Pandar QT64)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: camera
+    path: ../src/sensing/camera/camera_node.py
+    inputs:
+      tick: dora/timer/millis/33          # ~30Hz
+    outputs:
+      - image_raw
+    env:
+      CAMERA_DEVICE: /dev/video0
+      WIDTH: "1920"
+      HEIGHT: "1080"
+      FORMAT: nv12
+
+  - id: lidar
+    path: ../src/sensing/lidar/lidar_node.py
+    inputs:
+      tick: dora/timer/millis/100         # 10Hz
+    outputs:
+      - pointcloud
+    env:
+      LIDAR_MODEL: pandar_qt64
+      LIDAR_IP: "192.168.1.201"
+      LIDAR_PORT: "2368"
+
+  - id: gnss
+    path: ../src/sensing/gnss/gnss_node.py
+    inputs:
+      tick: dora/timer/millis/100
+    outputs:
+      - navsatfix
+    env:
+      GNSS_DEVICE: /dev/ttyUSB0
+      GNSS_BAUD: "115200"
+
+  - id: imu
+    path: ../src/sensing/imu/imu_node.py
+    inputs:
+      tick: dora/timer/millis/10          # 100Hz
+    outputs:
+      - imu_data
+    env:
+      IMU_DEVICE: /dev/ttyUSB1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PREPROCESSING (operators — zero overhead)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: image_preprocess
+    operators:
+      python: ../src/sensing/operators/image_preprocess.py
+    inputs:
+      image_raw: camera/image_raw
+    outputs:
+      - image_resized
+      - image_yuv
+    env:
+      RESIZE_WIDTH: "512"
+      RESIZE_HEIGHT: "256"
+      USE_RGA: "true"
+
+  - id: pointcloud_filter
+    operators:
+      python: ../src/sensing/operators/pointcloud_filter.py
+    inputs:
+      pointcloud: lidar/pointcloud
+    outputs:
+      - points_filtered
+    env:
+      VOXEL_SIZE: "0.1"
+      CROP_BOX_MIN: "[-50, -25, -3]"
+      CROP_BOX_MAX: "[50, 25, 1]"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PERCEPTION (VisionPilot models + Autoware YOLO pattern)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: driving_vision
+    path: ../src/perception/driving_vision/driving_vision_node.py
+    inputs:
+      image: image_preprocess/image_yuv
+    outputs:
+      - features
+      - engagement
+    env:
+      MODEL_PATH: /data/models/driving_vision_rk3688.rknn
+      NPU_CORE: "0"
+    restart_policy: on_failure
+    max_restarts: 3
+
+  - id: driving_policy
+    path: ../src/perception/driving_policy/driving_policy_node.py
+    inputs:
+      features: driving_vision/features
+      vehicle_state: vehicle_bridge/vehicle_state
+    outputs:
+      - neural_path
+      - leads
+    env:
+      MODEL_PATH: /data/models/driving_policy_rk3688.rknn
+      NPU_CORE: "0"
+    restart_policy: on_failure
+    max_restarts: 3
+
+  - id: lane_detector
+    path: ../src/perception/lane_detector/lane_detector_node.py
+    inputs:
+      image: image_preprocess/image_resized
+    outputs:
+      - lane_lines
+    env:
+      MODEL_PATH: /data/models/lane_detector_rk3688.rknn
+      NPU_CORE: "1"
+
+  - id: lidar_detector
+    path: ../src/perception/lidar_detector/lidar_detector_node.py
+    inputs:
+      pointcloud: pointcloud_filter/points_filtered
+    outputs:
+      - objects_3d
+    env:
+      MODEL_PATH: /data/models/pointpillars_rk3688.rknn
+      NPU_CORE: "1"
+
+  - id: traffic_light_detector
+    path: ../src/perception/traffic_light_detector/traffic_light_detector_node.py
+    inputs:
+      image: image_preprocess/image_resized
+    outputs:
+      - traffic_lights
+    env:
+      MODEL_PATH: /data/models/traffic_light_rk3688.rknn
+      NPU_CORE: "1"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PERCEPTION FUSION (combines camera + LiDAR → unified context)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: perception_fusion
+    path: ../src/perception/perception_fusion/perception_fusion_node.py
+    inputs:
+      camera_objects: driving_policy/leads
+      objects_3d: lidar_detector/objects_3d
+      lane_lines: lane_detector/lane_lines
+      traffic_lights: traffic_light_detector/traffic_lights
+      gnss_fix: gnss/navsatfix
+      imu_raw: imu/imu_data
+    outputs:
+      - perception_context
+    env:
+      FUSION_RATE: "20"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PLANNING (VisionPilot MPC + Autawre behavior patterns)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: behavior_planner
+    path: ../src/planning/behavior_planner/behavior_planner_node.py
+    inputs:
+      perception_context: perception_fusion/perception_context
+    outputs:
+      - maneuver_command
+    env:
+      PLANNING_RATE: "20"
+
+  - id: trajectory_planner
+    path: ../src/planning/trajectory_planner/trajectory_planner_node.py
+    inputs:
+      maneuver: behavior_planner/maneuver_command
+      perception_context: perception_fusion/perception_context
+    outputs:
+      - trajectory
+    env:
+      MPC_HORIZON: "20"
+      MPC_DT: "0.05"
+      SOLVER: acados
+    cpu_affinity: [4, 5]
+
+  - id: trajectory_selector
+    path: ../src/planning/trajectory_selector/trajectory_selector_node.py
+    inputs:
+      neural_trajectory: trajectory_planner/trajectory
+      classical_trajectory: auto_speed/classical_path
+    outputs:
+      - selected_trajectory
+    env:
+      SELECTOR_MODE: safety_first
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CONTROL (100Hz PID — VisionPilot proven)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: controller
+    path: ../src/control/controller/controller_node.py
+    inputs:
+      trajectory: trajectory_selector/selected_trajectory
+      vehicle_state: vehicle_bridge/vehicle_state
+    outputs:
+      - lateral_cmd
+      - longitudinal_cmd
+    env:
+      CONTROL_RATE: "100"
+      LATERAL_MODE: torque_pid
+      LONGITUDINAL_MODE: openpid
+    cpu_affinity: [6, 7]
+    restart_policy: never
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ROS2 BRIDGE (vehicle boundary — adapted from autoware.universe)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: vehicle_bridge
+    path: ../src/vehicle_bridge/vehicle_bridge_node.py
+    inputs:
+      lateral_cmd: controller/lateral_cmd
+      longitudinal_cmd: controller/longitudinal_cmd
+    outputs:
+      - vehicle_state
+    env:
+      ROS2_DOMAIN_ID: "0"
+      VEHICLE_CAN_INTERFACE: can0
+      DBC_PATH: /data/dbc/vehicle.dbc
