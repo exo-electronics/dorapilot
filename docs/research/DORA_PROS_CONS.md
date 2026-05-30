@@ -1,9 +1,10 @@
-# DORA vs ROS2: Pros & Cons for DoraPilot ADAS — Python-Native Stance
+# DORA vs ROS2: Pros & Cons for DoraPilot ADAS — Hybrid Baseline
 
 **Date:** 2026-05-30  
 **Research Source:** arxiv paper (Feb 2026), dora-rs GitHub, dora-benchmark, dora-autoware, community discussions, GOSIM 2024 presentations  
 **Context:** Next-gen ADAS stack for ExoPilot 03+ (RK3688, LiDAR, 12 TOPS NPU)  
-**Language Stance:** Python 3.10+ for all application nodes. No C++ application code.
+**Baseline:** Autoware.universe DORA port (patterns) + VisionPilot (ADAS logic + models)  
+**Language:** Python 3.10+ for all application nodes
 
 ---
 
@@ -27,18 +28,19 @@
 
 ## Why DORA for DoraPilot (The VisionPilot Successor Story)
 
-VisionPilot proved a Python-centric ADAS stack can run on RK3588/RK3688 edge SoC. It worked. But ROS2 became the bottleneck — not Python, not the NPU, not the models. **ROS2's DDS serialization is the tax**.
+VisionPilot proved that a Python-centric ADAS stack can work on edge SoC. DoraPilot replaces ROS2 with **dora-rs** to solve the one problem Python+ROS2 cannot fix: **inter-process communication overhead on large payloads**.
 
 ### The One Problem DORA Solves
 
-| Scenario | VisionPilot (ROS2) | DoraPilot (DORA) |
-|----------|-------------------|------------------|
-| LiDAR pointcloud (2.4MB) camera→fusion | 5–15ms jittery latency, 15–20% CPU core wasted on serialization | <1ms flat latency, **0% CPU** on IPC |
-| A/B test two driving models | Restart entire system | `dora node add` at runtime |
-| Regression test new model | Re-record ROS bag, no substitution | `dora replay --substitute driving_vision:new_model.py` |
-| Debug pipeline on vehicle | Dig through 150 packages, nested launch files | Single `dataflow.yml` + `dora top` |
+| VisionPilot Scenario | ROS2 Cost | DORA Benefit |
+|---------------------|-----------|--------------|
+| LiDAR pointcloud (2.4MB) moves from lidar_node → perception_fusion | 5–15ms jittery latency, 15–20% CPU core on serialization | <1ms flat, **0% CPU** on IPC |
+| Camera image (1.5MB) moves from camera_node → driving_vision | 3–8ms latency, CDR copy | <0.5ms, pointer pass |
+| A/B test classical vs neural planner | Full system restart | `dora node add` at runtime |
+| Regression test new driving model | Re-record bag, manual remapping | `dora replay --substitute` |
+| Debug on vehicle | Dig through 150 packages, nested launch files | Single `dataflow.yml` + `dora top` |
 
-**DORA does not replace Python. DORA replaces ROS2.** All of VisionPilot's Python code — NPU inference, MPC planning, PID control — stays Python. Only the middleware changes.
+**DORA replaces ROS2, not Python.** VisionPilot's Python code — NPU inference, MPC planning, PID control — stays Python. Only the middleware changes.
 
 ---
 
@@ -48,24 +50,27 @@ VisionPilot proved a Python-centric ADAS stack can run on RK3588/RK3688 edge SoC
 
 | Dimension | VisionPilot (ROS2) | DoraPilot (DORA) |
 |-----------|-------------------|------------------|
+| **Directory layout** | Flat package list (150+ pkgs) | Autoware-style hierarchy (`sensing/`, `perception/`, `planning/`, `control/`) |
 | **IPC** | DDS CDR serialization (copies data) | Zenoh SHM zero-copy (passes pointers) |
-| **Pipeline config** | 150 packages + nested Python launch files | Declarative `dataflow.yml` |
-| **Build system** | colcon + CMake + package.xml | `pip install dora-rs` — no build step for app code |
-| **Node language** | Python + C++ wrappers (mixed) | **Python only** — no C++ application nodes |
-| **Message format** | ROS2 `.msg` IDL → CDR | Apache Arrow → zero deserialization |
-| **Record/replay** | MCAP bag, no node substitution | `.drec` with `--substitute` for regression testing |
-| **Observability** | `ros2 topic hz` + external Grafana | `dora top`, `dora trace view` built-in |
-| **Topology changes** | Static at launch | Dynamic: `dora node add/remove/connect` live |
+| **Pipeline config** | 150 packages + launch files | Single `dataflow.yml` |
+| **Build system** | colcon + CMake + package.xml | `pip install dora-rs` (no build for app code) |
+| **Message format** | ROS2 `.msg` IDL → CDR | **drp_msgs** (Python dataclasses → Arrow) |
+| **Message compilation** | `rosidl` generates C++/Python | Zero compilation — import and use |
+| **Node packaging** | One node per package | Operators co-located, nodes as Python scripts |
+| **Record/replay** | MCAP bag (no substitution) | `.drec` with node substitution |
+| **Observability** | External Grafana | `dora top` built-in |
+| **Topology** | Static at launch | Dynamic runtime changes |
 
 ### What Does NOT Change
 
-- **Python application code** — all inference, planning, control logic stays Python
-- **ACADOS MPC** — same Python interface (`gen_long_mpc.py`), same generated C solver
-- **RKNN/Hailo models** — same `.rknn`/`.hef` files, same inference flow
-- **3-layer boundary** (App / System / Third_Party) — preserved
-- **Daemon pattern** (`camera_daemon`, `thermal_daemon`) — preserved
-- **MPC + PID two-layer control** (20Hz + 100Hz) — preserved
-- **NPU budget allocation** (85% TOPS safety line) — preserved
+1. **Python application code** — all inference, planning, control stays Python
+2. **ACADOS MPC** — same Python interface (`gen_long_mpc.py`), same generated C solver library
+3. **RKNN/Hailo models** — same `.rknn`/`.hef` files, same inference daemon pattern
+4. **3-layer boundary** (App / System / Third_Party) — preserved
+5. **Daemon pattern** (`camera_daemon`, `thermal_daemon`) — preserved
+6. **MPC + PID control layers** (20Hz + 100Hz) — preserved
+7. **NPU budget allocation** (85% TOPS safety line) — preserved
+8. **Vehicle CAN interface** — stays ROS2, bridged at boundary
 
 ---
 
@@ -212,16 +217,19 @@ ROS2 distributed requires DDS discovery tuning, multicast, domain IDs, and firew
 VisionPilot has separate packages for `crop_box_filter` and `voxel_grid_filter`. In DORA, these become **operators** — lightweight functions inside a shared runtime:
 
 ```python
-# operator: crop_box_filter.py
-import pyarrow as pa
+# operator: pointcloud_filter.py
+from dora import DoraStatus
 import numpy as np
+from drp_msgs import PointCloud2
+from drp_msgs.utils import to_arrow, from_arrow
 
-class CropBoxFilter:
+class Operator:
     def on_input(self, dora_input, send_output):
-        data = dora_input["value"].to_numpy().view(np.uint8)
-        points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
-        filtered = points[(points[:,0] > self.x_min) & (points[:,0] < self.x_max)]
-        send_output("filtered", pa.array(filtered.tobytes()))
+        pc2 = from_arrow(dora_input["value"], PointCloud2)
+        points = pc2.to_numpy()
+        filtered = points[(points[:,0] > -50) & (points[:,0] < 50)]
+        result = PointCloud2.from_xyz_array(filtered, header=pc2.header)
+        send_output("filtered", to_arrow(result))
 ```
 
 No `package.xml`, no `setup.py`, no node overhead. Just a Python function.
@@ -329,16 +337,21 @@ DORA supports Python operator hot-reload. This is amazing for development but **
 - Use `restart_policy: never` for safety nodes
 - Separate `dev` dataflows from `prod` dataflows
 
-### 8. Message Schema Migration — Arrow vs ROS2 IDL
+### 8. Message Schema Migration — drp_msgs vs ROS2 IDL
 
 VisionPilot has **~100 custom message types** in `evp_msgs/` (ROS2 `.msg` / `.srv`).
 
 Migrating to DORA means:
 - Option A: Keep ROS2 msg definitions, bridge everything (loses zero-copy benefits)
 - Option B: Define Arrow schemas for all messages (significant upfront work)
-- Option C: Use Python dictionaries + PyArrow arrays for prototyping, migrate to strict schemas later
+- **Option C: drp_msgs** — pure Python dataclasses with ROS2-compatible naming
 
-**Recommended for dorapilot (Python-only):** Start with Option C. Use Python `dict` with Arrow arrays for data. No need for IDL compilation. Migrate to strict Arrow schemas once dataflow stabilizes.
+**drp_msgs is the sweet spot:**
+- Familiar to Autoware developers (same names, same fields)
+- Zero compilation (pure Python)
+- Type-safe (dataclasses + IDE autocomplete)
+- Native Arrow serialization via `to_arrow()` / `from_arrow()`
+- Easy ROS2 bridge conversion via `to_dict()` / `from_dict()`
 
 ### 9. Community Size & Support Risk
 
@@ -347,7 +360,7 @@ Migrating to DORA means:
 | GitHub stars (core) | ~3,500 (ros2) | ~2,500 (dora-rs) |
 | Discussions / issues volume | Massive | Small but responsive |
 | Commercial support | Multiple vendors (Open Robotics, Tier IV, etc.) | Mostly community |
-| Conference presence | IROS, ICRA, ROSCon everywhere | FOSIM, GOSIM, smaller |
+| Conference presence | IROS, ICRA, ROSCon everywhere | FOSDEM, GOSIM, smaller |
 
 If dora-rs development slows or pivots, dorapilot is exposed. ROS2 is backed by the Open Robotics Foundation and dozens of OEMs.
 
@@ -375,25 +388,28 @@ If dora-rs development slows or pivots, dorapilot is exposed. ROS2 is backed by 
 
 ## Best Practices from dora-autoware (Real-Vehicle Ported Experience)
 
-### Lesson 1: Python-First is the Intended Pattern
-The dora-autoware port uses the **Python API** for the majority of nodes. NDT localization, object detection, planning — all Python. The Rust core handles IPC; application logic stays Python. This is not a workaround; it is the pattern.
+### Lesson 1: Python API is Production-Ready
+The dora-autoware project ported NDT localization, object detection, and planning to DORA using the **Python API** — not C++. The Rust core handles IPC; Python handles algorithm logic. This is the intended pattern.
 
-### Lesson 2: Never Bridge PointCloud2
-The dora-autoware team hit a **hard blocker**: PointCloud2 struct arrays panic the Arrow↔ROS2 converter. Their successful fix: keep LiDAR 100% DORA-native. Dorapilot adopts this rule as law.
-
-### Lesson 3: Parse Raw Bytes with Numpy (No C++ Parser)
-Instead of a C++ parsing node, use numpy byte parsing:
+### Lesson 2: Numpy Byte Parsing Replaces C++ Parsers
+Instead of writing a C++ node to parse LiDAR bytes, use numpy:
 ```python
 data = event["value"].to_numpy().view(np.uint8)
 points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
 ```
 This is C-speed (numpy-vectorized) and eliminates a C++ node entirely.
 
-### Lesson 4: Separate Safety Dataflow
-Autoware's safety modules run in an **independent dataflow**. A main pipeline restart does not affect AEB/MRM. Dorapilot uses `dorapilot_safety.yml` separate from `dorapilot_main.yml`.
+### Lesson 3: Keep LiDAR 100% DORA-Native
+The dora-autoware team discovered the ROS2 bridge **panics on PointCloud2 struct arrays**. Their solution: never bridge LiDAR data. Dorapilot adopts this as a hard rule.
 
-### Lesson 5: Start Simple, Migrate Gradually
-Dora-autoware did not port everything at once. They started with sensing → perception → planning, kept vehicle interface in ROS2, and bridged at the boundary. Dorapilot follows the same phased approach.
+### Lesson 4: Separate Safety Dataflow
+Autoware's safety modules run in an **independent dataflow** so main pipeline restarts don't affect AEB/MRM. Dorapilot uses `dorapilot_safety.yml` separate from `dorapilot_main.yml`.
+
+### Lesson 5: drp_msgs > Raw Dicts > Arrow Schemas
+For a hybrid team (Autoware + VisionPilot backgrounds):
+- **Arrow schemas alone** are too low-level for developers
+- **Raw Python dicts** are too error-prone (typos, no autocomplete)
+- **drp_msgs dataclasses** hit the sweet spot: familiar API, type-safe, zero compilation
 
 ---
 
@@ -442,6 +458,7 @@ Dora-autoware did not port everything at once. They started with sensing → per
 3. Migration is gradual — ROS2 bridge for vehicle interface and non-critical modules
 4. We accept the risk of a younger ecosystem in exchange for 10-30× IPC performance
 5. We commit to **Python-only application code** — no C++ nodes, no CMake, no Rust required for daily development
+6. We adopt **Autoware directory conventions + drp_msgs** for developer familiarity
 
 **ROS2 would be safer IF:**
 1. We needed off-the-shelf Nav2, MoveIt, or complex C++ libraries
@@ -450,7 +467,7 @@ Dora-autoware did not port everything at once. They started with sensing → per
 4. We are not comfortable with a younger framework
 
 **Recommended path for dorapilot:**
-> **Hybrid architecture**: DORA-native for sensing + perception + planning + control (the data-heavy pipeline, all in Python). ROS2 bridge for vehicle actuation, voice, navigation, and dashboard. This gives us 90% of DORA's performance benefits with 10% of the migration risk. And we keep 100% Python — the language that made VisionPilot work.
+> **Hybrid architecture**: DORA-native for sensing + perception + planning + control (the data-heavy pipeline, all in Python, with Autoware-style directory layout). ROS2 bridge for vehicle actuation, voice, navigation, and dashboard. drp_msgs for type-safe message passing. This gives us 90% of DORA's performance benefits with Autoware developer familiarity and 10% of the migration risk.
 
 ---
 
@@ -467,4 +484,4 @@ Dora-autoware did not port everything at once. They started with sensing → per
 
 ---
 
-*Document version 1.0 — 2026-05-30 — Python-Native Edition*
+*Document version 2.0 — 2026-05-30 — Hybrid Baseline Edition*

@@ -1,9 +1,10 @@
-# DORA Migration Research: From VisionPilot (ROS2) to DoraPilot — Python-Native
+# DORA Migration Research: From VisionPilot (ROS2) to DoraPilot — Hybrid Baseline
 
-**Date:** 2026-05-30  
-**Status:** Research Complete — Architecture Proposal Ready  
-**Target:** ExoPilot 03+ (RK3688, LiDAR-enabled, 12 TOPS NPU)  
-**Language Stance:** Python 3.10+ for all application nodes. No C++ nodes, no CMake, no package.xml for DORA-native components.
+**Date:** 2026-05-30
+**Status:** Research Complete — Architecture v2.0 Active Development
+**Target:** ExoPilot 03+ (RK3688, LiDAR-enabled, 12 TOPS NPU)
+**Baseline:** Autoware.universe DORA port (patterns) + VisionPilot (ADAS logic + models)
+**Language:** Python 3.10+ for all application nodes. No C++ nodes, no CMake, no package.xml for DORA-native components.
 
 > 📋 **Companion Document:** See [`DORA_PROS_CONS.md`](./DORA_PROS_CONS.md) for detailed comparative analysis, benchmark data, and risk assessment.
 
@@ -14,6 +15,13 @@
 DoraPilot is the next-generation ADAS stack replacing VisionPilot's ROS2-centric architecture with **dora-rs** (Dataflow-Oriented Robotic Architecture). DORA provides **10-31× faster IPC** than ROS2 (validated by arxiv peer-reviewed benchmarks), zero-copy shared memory via Zenoh/Apache Arrow, declarative dataflow pipelines, and native record/replay — critical advantages for real-time LiDAR+camera fusion at 20Hz on resource-constrained edge SoCs.
 
 **Key validation:** The Feb 2026 arxiv paper *"DORA: Dataflow Oriented Robotic Architecture"* (2602.13252v1) rigorously benchmarks DORA against ROS2 Humble/FastDDS and CyberRT. For 4MB payloads at 20Hz (typical for camera+LiDAR), DORA achieves **0.82 ms** latency vs ROS2's **17.1 ms** — a **21× advantage**. For 32MB LiDAR bursts, DORA is **31× faster** (2.78 ms vs 87 ms). Real-world robot arm deployment showed DORA at **1.5 ms** vs ROS2 at **22 ms**.
+
+**Hybrid baseline:** Rather than building from scratch, dorapilot adopts:
+- **Autoware.universe directory structure** (`sensing/`, `perception/`, `planning/`, `control/`) for developer familiarity
+- **Autoware message conventions** via `drp_msgs` (pure-Python dataclasses with ROS2-compatible naming)
+- **VisionPilot's ADAS logic** (driving_vision, driving_policy, behavior_planner, MPC+PID control)
+- **VisionPilot's NPU models** (RKNN/Hailo) and vehicle integration
+- **dora-autoware's patterns** for LiDAR byte parsing, ROS2 bridge, dataflow YAML structure
 
 **Python-native commitment:** All application nodes in dorapilot are Python. DORA's Python API (`pip install dora-rs`, `from dora import Node`) is first-class and production-ready. There are no C++ application nodes, no CMake build steps, and no Rust required for daily development. The Rust core handles IPC; Python handles ADAS logic.
 
@@ -29,6 +37,8 @@ Additionally, the **dora-autoware** project has already demonstrated porting Aut
 | **Pipeline Definition** | Python launch files + param YAML | Declarative `dataflow.yml` |
 | **Language** | Python 3.10 + C++ (mixed, wrappers) | **Python 3.10+ only** |
 | **Build System** | colcon + CMake + package.xml | `pip install dora-rs` — no build for app code |
+| **Message System** | ROS2 `.msg` IDL + `evp_msgs` | **drp_msgs** (Python dataclasses → Arrow) |
+| **Message Compilation** | `rosidl` generates C++/Python | Zero compilation — import and use |
 | **Hot Reload** | Restart entire launch | Python operator hot-reload |
 | **Record/Replay** | MCAP bag (ROS2 native) | `.drec` native + node substitution |
 | **Dynamic Topology** | Static at launch | `dora node add/remove/connect` live |
@@ -47,8 +57,8 @@ VisionPilot works. It runs on RK3588. It drives the car. So why migrate?
 |---------------------|-----------|--------------|
 | LiDAR pointcloud (2.4MB) moves from lidar_node → perception_fusion | 5–15ms jittery latency, 15–20% CPU core on serialization | <1ms flat, **0% CPU** on IPC |
 | Camera image (1.5MB) moves from camera_node → driving_vision | 3–8ms latency, CDR copy | <0.5ms, pointer pass |
-| A/B test classical vs neural planner | Full system restart | `dora node add` at runtime |
-| Regression test new driving model | Re-record bag, manual remapping | `dora replay --substitute` |
+| A/B test two driving models | Restart entire system | `dora node add` at runtime |
+| Regression test new model | Re-record bag, manual remapping | `dora replay --substitute` |
 | Debug on vehicle | Navigate 150 packages, nested launch files | Single `dataflow.yml` + `dora top` |
 
 **DORA replaces ROS2, not Python.** VisionPilot's Python code — NPU inference, MPC planning, PID control — stays Python. Only the middleware changes.
@@ -59,14 +69,16 @@ VisionPilot works. It runs on RK3588. It drives the car. So why migrate?
 
 ### What Changes
 
-1. **Middleware:** ROS2 DDS → DORA Zenoh SHM (zero-copy)
-2. **Pipeline config:** 150 packages + launch files → single `dataflow.yml`
-3. **Build system:** colcon + CMake → `pip install dora-rs` (no build for app code)
-4. **Message format:** ROS2 `.msg` IDL → Apache Arrow arrays + Python dicts
-5. **Node packaging:** One node per package → operators co-located, nodes as Python scripts
-6. **Record/replay:** MCAP bag → `.drec` with node substitution
-7. **Observability:** External Grafana → `dora top` built-in
-8. **Topology:** Static at launch → dynamic runtime changes
+1. **Directory layout:** Flat 150 packages → Autoware-style hierarchy (`sensing/`, `perception/`, `planning/`, `control/`)
+2. **Middleware:** ROS2 DDS → DORA Zenoh SHM (zero-copy)
+3. **Pipeline config:** 150 packages + launch files → single `dataflow.yml`
+4. **Build system:** colcon + CMake → `pip install dora-rs` (no build for app code)
+5. **Message format:** ROS2 `.msg` IDL → **drp_msgs** (Python dataclasses + Arrow)
+6. **Message compilation:** `rosidl` → **zero compilation**
+7. **Node packaging:** One node per package → operators co-located, nodes as Python scripts
+8. **Record/replay:** MCAP bag → `.drec` with node substitution
+9. **Observability:** External Grafana → `dora top` built-in
+10. **Topology:** Static at launch → dynamic runtime changes
 
 ### What Does NOT Change
 
@@ -77,7 +89,7 @@ VisionPilot works. It runs on RK3588. It drives the car. So why migrate?
 5. **Daemon pattern** — `camera_daemon`, `thermal_daemon` preserved as DORA nodes
 6. **MPC + PID control layers** (20Hz + 100Hz) — preserved
 7. **NPU budget allocation** (85% TOPS safety line) — preserved
-8. **Vehicle CAN interface** — stays ROS2, bridged at boundary
+8. **Vehicle integration** — CAN codec, DBC parser, vehicle dynamics preserved
 
 ---
 
@@ -197,14 +209,14 @@ DORA replaces "nodes + topics" with **dataflows**: directed graphs of nodes/oper
 # ALL nodes are Python scripts. No C++ nodes.
 nodes:
   - id: camera
-    path: src/sensing/camera_node/camera_node.py
+    path: src/sensing/camera/camera_node.py
     inputs:
       tick: dora/timer/millis/33    # ~30Hz
     outputs:
       - image
 
   - id: driving_vision
-    path: src/perception/driving_vision_node/driving_vision_node.py
+    path: src/perception/driving_vision/driving_vision_node.py
     inputs:
       image: camera/image
     outputs:
@@ -212,7 +224,7 @@ nodes:
       - engagement
 
   - id: driving_policy
-    path: src/perception/driving_policy_node/driving_policy_node.py
+    path: src/perception/driving_policy/driving_policy_node.py
     inputs:
       features: driving_vision/features
       vehicle_state: vehicle_bridge/vehicle_state
@@ -221,11 +233,11 @@ nodes:
       - leads
 
   - id: trajectory_selector
-    path: src/planning/trajectory_selector_node/trajectory_selector_node.py
+    path: src/planning/trajectory_selector/trajectory_selector_node.py
     inputs:
       neural_path: driving_policy/neural_path
       classical_path: auto_speed/path
-      lidar_objects: lidar_detector/objects
+      lidar_objects: lidar_detector/objects_3d
     outputs:
       - selected_trajectory
 ```
@@ -288,7 +300,7 @@ This allows **gradual migration**: keep vehicle interface, CAN stack, and existi
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        DoraPilot Stack v1.0 (DORA-native, Python-only)      │
+│              DoraPilot Stack v2.0 (Hybrid Autoware + VisionPilot)           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  L0: SENSING DAEMONS (DORA nodes, Python, various Hz)                       │
@@ -342,24 +354,24 @@ VisionPilot's package explosion is partly due to ROS2's "one node per package" p
 
 | VisionPilot (ROS2) | DoraPilot (DORA) | Notes |
 |-------------------|------------------|-------|
-| `camera_driver` | `camera_node/camera_node.py` | DORA node, V4L2 capture, Python |
-| `hesai_driver` | `lidar_node/lidar_node.py` | DORA node, Pandar QT64, Python |
-| `stereo_matcher` | `stereo_node/stereo_node.py` | DORA node + SGM operator, Python |
-| `image_preprocessor` | **operators inside `camera_node/`** | crop/resize as operators, not separate pkgs |
-| `sensing_quality` | `quality_operator.py` | In-process quality analysis |
+| `camera_driver` | `camera/camera_node.py` | DORA node, V4L2 capture, Python |
+| `hesai_driver` | `lidar/lidar_node.py` | DORA node, Pandar QT64, Python |
+| `stereo_matcher` | `stereo/stereo_node.py` | DORA node + SGM operator, Python |
+| `image_preprocessor` | `operators/image_preprocess.py` | crop/resize as operators, not separate pkgs |
+| `sensing_quality` | `operators/quality_operator.py` | In-process quality analysis |
 
 #### Perception Layer (`src/perception/`)
 
 | VisionPilot (ROS2) | DoraPilot (DORA) | Notes |
 |-------------------|------------------|-------|
-| `driving_model` | `driving_vision_node/driving_vision_node.py` | NPU node — isolated process, Python |
-| `split_model` | `driving_policy_node/driving_policy_node.py` | NPU node — isolated process, Python |
-| `lane_detector` | `lane_detection_node/lane_detection_node.py` | NPU node, Python |
-| `auto_speed` | `auto_speed_node/auto_speed_node.py` | ONNX/CPU node, Python |
-| `lidar_detector` | `lidar_perception_node/lidar_perception_node.py` | Hailo-8 or NPU, Python |
-| `perception_fusion` | `perception_fusion_node/perception_fusion_node.py` | CPU node, Python |
+| `driving_model` | `driving_vision/driving_vision_node.py` | NPU node — isolated process, Python |
+| `split_model` | `driving_policy/driving_policy_node.py` | NPU node — isolated process, Python |
+| `lane_detector` | `lane_detector/lane_detector_node.py` | NPU node, Python |
+| `auto_speed` | `auto_speed/auto_speed_node.py` | ONNX/CPU node, Python |
+| `lidar_detector` | `lidar_detector/lidar_detector_node.py` | Hailo-8 or NPU, Python |
+| `perception_fusion` | `perception_fusion/perception_fusion_node.py` | CPU node, outputs PerceptionContext |
 | `object_tracker` | `tracker_operator.py` | Lightweight — operator, not node |
-| `crop_box_filter`, `voxel_grid_filter` | `filter_operators.py` | In-process pointcloud filters |
+| `crop_box_filter`, `voxel_grid_filter` | `operators/filter_operators.py` | In-process pointcloud filters |
 
 **Key insight**: DORA operators eliminate the need for separate `crop_box_filter` and `voxel_grid_filter` packages. They become functions inside a shared operator runtime.
 
@@ -367,22 +379,22 @@ VisionPilot's package explosion is partly due to ROS2's "one node per package" p
 
 | VisionPilot (ROS2) | DoraPilot (DORA) | Notes |
 |-------------------|------------------|-------|
-| `behavior_planner` | `behavior_planner_node/behavior_planner_node.py` | CPU node, Python |
-| `trajectory_planner` | `trajectory_planner_node/trajectory_planner_node.py` | ACADOS Python interface |
-| `longitudinal_planner` | merged into `trajectory_planner_node` | Simplify — one MPC node |
-| `lateral_planner` | merged into `trajectory_planner_node` | Simplify |
-| `velocity_smoother` | `smoother_operator.py` | Operator for velocity profile filtering |
-| `trajectory_comparator` | `trajectory_selector_node/trajectory_selector_node.py` | Selects best from parallel generators |
+| `behavior_planner` | `behavior_planner/behavior_planner_node.py` | CPU node, Python |
+| `trajectory_planner` | `trajectory_planner/trajectory_planner_node.py` | ACADOS Python interface |
+| `longitudinal_planner` | merged into `trajectory_planner` | Simplify — one MPC node |
+| `lateral_planner` | merged into `trajectory_planner` | Simplify |
+| `velocity_smoother` | `operators/smoother_operator.py` | Operator for velocity profile filtering |
+| `trajectory_comparator` | `trajectory_selector/trajectory_selector_node.py` | Selects best from parallel generators |
 
 #### Control Layer (`src/control/`)
 
 | VisionPilot (ROS2) | DoraPilot (DORA) | Notes |
 |-------------------|------------------|-------|
-| `vehicle_controller` | `controller_node/controller_node.py` | 100Hz control node, Python |
-| `trajectory_follower` | `follower_operator.py` | In-process path tracking |
-| `lat_control_torque` | `lateral_pid_operator.py` | Operator (in-process) |
-| `long_control` | `longitudinal_pid_operator.py` | Operator (in-process) |
-| `control_validator` | `control_validator_operator.py` | In-process safety check |
+| `vehicle_controller` | `controller/controller_node.py` | 100Hz control node, Python |
+| `trajectory_follower` | `operators/follower_operator.py` | In-process path tracking |
+| `lat_control_torque` | `operators/lateral_pid_operator.py` | Operator (in-process) |
+| `long_control` | `operators/longitudinal_pid_operator.py` | Operator (in-process) |
+| `control_validator` | `operators/control_validator_operator.py` | In-process safety check |
 
 #### System Layer (`src/system/`)
 
@@ -477,17 +489,20 @@ dora top --once > /tmp/system_health.json
 
 ## 6. Python-First Implementation (No C++ Application Code)
 
-### 6.1 Standard Node Pattern
+### 6.1 Standard Node Pattern with drp_msgs
 
-All dorapilot nodes use the Python `dora.Node` API:
+All dorapilot nodes use the Python `dora.Node` API + `drp_msgs` for type safety:
 
 ```python
+#!/usr/bin/env python3
 from dora import Node
 import pyarrow as pa
 import numpy as np
-import json
 
-class LidarPerceptionNode:
+from drp_msgs import PointCloud2, DetectedObjectArray
+from drp_msgs.utils import to_arrow, from_arrow
+
+class LidarDetectorNode:
     def __init__(self):
         self.node = Node()
         self.model = self.load_rknn_model()
@@ -500,13 +515,16 @@ class LidarPerceptionNode:
                 break
 
     def on_input(self, event):
-        # Zero-copy: PyArrow array → numpy view
-        data = event["value"].to_numpy().view(np.uint8)
-        points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
-        
+        # Receive PointCloud2 from DORA (zero-copy)
+        pc2 = from_arrow(event["value"], PointCloud2)
+        points = pc2.to_numpy()
+
+        # Run NPU inference
         objects_3d = self.model.infer(points)
-        result_json = json.dumps(objects_3d)
-        self.node.send_output("objects_3d", pa.array([result_json]))
+
+        # Send DetectedObjectArray back to DORA
+        result = DetectedObjectArray(header=pc2.header, objects=objects_3d)
+        self.node.send_output("objects_3d", to_arrow(result))
 
     def load_rknn_model(self):
         from rknnlite.api import RKNNLite
@@ -516,37 +534,55 @@ class LidarPerceptionNode:
         return rknn
 
 if __name__ == "__main__":
-    node = LidarPerceptionNode()
-    node.run()
+    LidarDetectorNode().run()
 ```
 
-### 6.2 Operator Pattern
+### 6.2 Operator Pattern with drp_msgs
 
 ```python
-# In-process operator for zero-overhead transforms
-import pyarrow as pa
+#!/usr/bin/env python3
+from dora import DoraStatus
 import numpy as np
 
-class PointcloudFilter:
-    def __init__(self):
-        self.voxel_size = 0.1
-        self.crop_min = np.array([-50, -25, -3])
-        self.crop_max = np.array([50, 25, 1])
+from drp_msgs import PointCloud2
+from drp_msgs.utils import to_arrow, from_arrow
+
+class Operator:
+    def on_event(self, dora_event, send_output):
+        if dora_event["type"] == "INPUT":
+            return self.on_input(dora_event, send_output)
+        return DoraStatus.CONTINUE
 
     def on_input(self, dora_input, send_output):
-        data = dora_input["value"].to_numpy().view(np.uint8)
-        points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
-        
+        pc2 = from_arrow(dora_input["value"], PointCloud2)
+        points = pc2.to_numpy()
+
         # Crop box filter (numpy-vectorized, C-speed)
-        mask = np.all((points[:, :3] >= self.crop_min) & (points[:, :3] <= self.crop_max), axis=1)
+        mask = ((points[:, 0] > -50) & (points[:, 0] < 50) &
+                (points[:, 1] > -25) & (points[:, 1] < 25))
         filtered = points[mask]
-        
-        send_output("points_filtered", pa.array(filtered.tobytes()))
+
+        result = PointCloud2.from_xyz_array(filtered, header=pc2.header)
+        send_output("points_filtered", to_arrow(result))
+        return DoraStatus.CONTINUE
 ```
 
-### 6.3 ACADOS MPC (Python Interface — No C++ Node)
+### 6.3 drp_msgs Benefits Over Raw Dicts
 
-VisionPilot's trajectory planner uses ACADOS via its Python interface. This is preserved unchanged:
+| Aspect | Raw `dict` | `drp_msgs` dataclass |
+|--------|-----------|---------------------|
+| **IDE autocomplete** | ❌ No | ✅ Full |
+| **Type errors** | ❌ Runtime `KeyError` | ✅ `dataclass` field validation |
+| **Refactor safety** | ❌ Find/replace grep | ✅ Static analysis catches renamed fields |
+| **Documentation** | ❌ Scattered comments | ✅ Centralized `src/drp_msgs/` |
+| **Arrow serialization** | Manual `json.dumps()` | Built-in `to_arrow()` / `from_arrow()` |
+| **ROS2 bridge** | Manual field mapping | `to_dict()` helper for bridge nodes |
+| **Unit suffixes** | Convention only | Enforced in field names (`_m`, `_mps`, `_rad`) |
+| **Build step** | None | None (pure Python) |
+
+### 6.4 ACADOS MPC (Python Interface — No C++ Node)
+
+VisionPilot's trajectory planner uses ACADOS via its Python interface. Preserved unchanged:
 
 ```python
 from acados_template import AcadosOcpSolver
@@ -555,26 +591,24 @@ import numpy as np
 class TrajectoryPlannerNode:
     def __init__(self):
         self.solver = AcadosOcpSolver(self.create_ocp())
-        
+
     def plan(self, maneuver, context):
         x0 = np.array([context.position_x, context.position_y,
                        context.velocity_mps, context.heading_rad])
         self.solver.set(0, "lbx", x0)
         self.solver.set(0, "ubx", x0)
-        
-        # Solve MPC (generated C solver, called from Python)
         status = self.solver.solve()
         trajectory = self.solver.get(1, "x")
         return trajectory
 ```
 
-The generated C solver is a shared library (`.so`) loaded by Python. No C++ node is needed. This is the standard ACADOS workflow.
+The generated C solver is a shared library (`.so`) loaded by Python. No C++ node is needed.
 
-### 6.4 No Build Step for Application Code
+### 6.5 No Build Step for Application Code
 
 ```bash
 # VisionPilot: build everything
-cd ~/pilot/visionpilot && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+cd ~/pilot/visionpilot && colcon build --symlink-install
 
 # DoraPilot: just install dora-rs and run
 pip install dora-rs
@@ -585,21 +619,22 @@ No `CMakeLists.txt`. No `package.xml`. No `setup.py` for nodes. Python scripts e
 
 ---
 
-## 7. Migration Strategy (Python-Only)
+## 7. Migration Strategy (Python-Only, Hybrid Baseline)
 
 ### Phase 1: Foundation (Weeks 1-4)
 
 1. **Bootstrap DORA** on RK3688: `pip install dora-rs`, verify `dora run` works
 2. **Port inference HAL**: Convert `system/inference_ecu` to DORA node `inference_daemon` (Python layer unchanged)
-3. **Single pipeline**: camera → preprocess (operators) → driving_vision (Python node) → ros2_bridge → vehicle
-4. **Validate** end-to-end with `dora top` monitoring
+3. **Implement drp_msgs**: Port `evp_msgs` ROS definitions to Python dataclasses
+4. **Single pipeline**: camera → preprocess (operators) → driving_vision (Python node) → ros2_bridge → vehicle
+5. **Validate** end-to-end with `dora top` monitoring
 
 ### Phase 2: Perception (Weeks 5-10)
 
 1. Migrate `perception/driving_model` → `driving_vision_node` (Python, RKNNLite API)
-2. Migrate `perception/lane_detector` → `lane_detection_node` (Python)
-3. Add LiDAR pipeline: `lidar_node` (Python) → filter operators (Python) → `lidar_perception_node` (Python)
-4. Sensor fusion: `perception_fusion_node` consuming camera + LiDAR via Zenoh SHM (Python)
+2. Migrate `perception/lane_detector` → `lane_detector_node` (Python)
+3. Add LiDAR pipeline: `lidar_node` (Python, Pandar QT64) → filter operators (Python) → `lidar_detector_node` (Python)
+4. Sensor fusion: `perception_fusion_node` consuming camera + LiDAR via Zenoh SHM, outputting `PerceptionContext`
 
 ### Phase 3: Planning + Control (Weeks 11-16)
 
@@ -642,10 +677,13 @@ This is C-speed underneath (numpy is C) and eliminates a C++ node entirely.
 The dora-autoware team discovered the ROS2 bridge **panics on PointCloud2 struct arrays**. Their solution: never bridge LiDAR data. Dorapilot adopts this as a hard rule.
 
 ### 8.4 Lesson: Separate Safety Dataflow
-Autoware's safety-critical modules run in an **independent dataflow** so main pipeline restarts don't affect AEB/MRM. Dorapilot uses `dorapilot_safety.yml` separate from `dorapilot_main.yml`.
+Autoware's safety modules run in an **independent dataflow** so main pipeline restarts don't affect AEB/MRM. Dorapilot uses `dorapilot_safety.yml` separate from `dorapilot_main.yml`.
 
-### 8.5 Lesson: Start with Python Dicts, Migrate to Arrow Schemas Later
-Dora-autoware started with simple Python dictionaries for message passing and gradually added Arrow schema validation. Dorapilot follows the same path: prototype with `dict`, formalize with Arrow once stable.
+### 8.5 Lesson: Use drp_msgs, Not Raw Dicts
+For a hybrid team (Autoware + VisionPilot backgrounds):
+- **Arrow schemas alone** are too low-level
+- **Raw Python dicts** are too error-prone
+- **drp_msgs dataclasses** hit the sweet spot: familiar API, type-safe, zero compilation
 
 ---
 
@@ -659,7 +697,7 @@ Dora-autoware started with simple Python dictionaries for message passing and gr
 | **Safety certification** | 🟡 Medium | DORA's deterministic dataflow is architecturally better, but no precedents yet. Document timing budgets rigorously. |
 | **Hot reload in safety-critical code** | 🟡 Medium | Disable hot reload for AEB/MRM nodes. Use `restart_policy: never` in production. |
 | **Coordinator HA partial reclaim** | 🟡 Medium | Run coordinator as systemd `Restart=always`. Split safety-critical subsystems into independent `dora run` dataflows. |
-| **Message schema migration (Arrow)** | 🟢 Low | Start with Python dict + PyArrow arrays. No IDL compilation needed. Migrate to strict schemas incrementally. |
+| **Message schema migration (drp_msgs)** | 🟢 Low | drp_msgs is pure Python — no IDL compilation. Add fields incrementally. ROS2 bridge via `to_dict()` fallback. |
 | **Community size & long-term support** | 🟡 Medium | DORA is Apache-2.0. Fork if needed. Track GOSIM/autoware adoption as health indicators. |
 | **Team expertise (Rust)** | 🟢 Low | **Not needed for application code.** Daily development is 100% Python. Only DORA internals use Rust. |
 
@@ -681,27 +719,27 @@ Dora-autoware started with simple Python dictionaries for message passing and gr
 | **Budget-based NPU allocation** (85% TOPS safety line) | Preserve: `inference_daemon` manages core allocation |
 | **MPC + PID two-layer control** (20Hz + 100Hz) | Preserve: `trajectory_planner_node` (20Hz) + `controller_node` (100Hz with operators) |
 | **Param YAML convention** (`.param.yaml`) | Replace with DORA node `env:` in `dataflow.yml` + environment overrides |
-| **Unit suffixes** (`_mps`, `_deg`, `_rad`) | Preserve in Python dict keys |
+| **Unit suffixes** (`_mps`, `_deg`, `_rad`) | Preserve in drp_msgs field names |
 
 ---
 
 ## 11. Open Questions for Team Discussion
 
-1. **Should dorapilot support RK3576 (6 TOPS) or RK3688-only (12 TOPS)?**  
+1. **Should dorapilot support RK3576 (6 TOPS) or RK3688-only (12 TOPS)?**
    DORA's lower overhead helps RK3576, but LiDAR fusion likely requires RK3688.
 
-2. **Should we keep `evp_msgs` ROS message definitions or migrate to Python dicts + Arrow?**  
-   Python dicts enable fastest prototyping. Arrow schemas add validation but require more design.
+2. **Should we migrate `evp_msgs` to `drp_msgs` incrementally or all at once?**
+   Incremental: start with `PerceptionContext`, add other messages as nodes are ported.
 
-3. **Should the split Vision+Policy architecture (OpenPilot 0.10.x) be the default in v1.0?**  
+3. **Should the split Vision+Policy architecture (OpenPilot 0.10.x) be the default in v1.0?**
    VisionPilot currently uses single-stage; DORA's dataflow naturally supports the split model.
 
-4. **How deep should the ROS2 bridge go?**  
-   Option A: Bridge only at vehicle/actuator boundary.  
-   Option B: Bridge all non-critical modules (voice, nav, dashboard).  
+4. **How deep should the ROS2 bridge go?**
+   Option A: Bridge only at vehicle/actuator boundary.
+   Option B: Bridge all non-critical modules (voice, nav, dashboard).
    Option C: Full migration (no ROS2).
 
-5. **Should we use DORA operators for the 100Hz control loop?**  
+5. **Should we use DORA operators for the 100Hz control loop?**
    Operators run in-process with the runtime, offering <100µs latency, but a crash in any operator crashes the runtime. For safety, keep PID controllers as operators within a dedicated `control_runtime` node.
 
 ---
@@ -722,4 +760,4 @@ Dora-autoware started with simple Python dictionaries for message passing and gr
 
 ---
 
-*Research completed 2026-05-30. Python-Native Edition. Ready for architecture review and Phase 1 planning.*
+*Research completed 2026-05-30. Hybrid Baseline Edition. Ready for architecture review and Phase 1 planning.*
