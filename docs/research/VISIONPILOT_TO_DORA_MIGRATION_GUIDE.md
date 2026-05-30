@@ -1,200 +1,143 @@
 # VisionPilot → DoraPilot Migration Guide
 
 **Date:** 2026-05-30  
-**Status:** Reference Implementation Guide  
+**Status:** Active Development Guide  
 **Reference Projects:**
-- `~/pilot/visionpilot` — Source ROS2 baseline
+- `~/pilot/visionpilot` — Source ROS2 baseline (~150 packages, `evp_msgs`)
 - `~/pilot/autoware.universe` — DORA Autoware reference (dora-rs port)
 
 ---
 
 ## Executive Summary
 
-This document provides concrete, line-by-line migration patterns for transforming VisionPilot's ROS2 Humble stack into DoraPilot's DORA-native architecture. Every pattern is validated against the **dora-autoware.universe** project, which has already successfully ported Autoware modules (NDT localization, EKF, IMU corrector, GNSS poser, YOLO perception) to DORA with real-vehicle deployment.
+This guide provides concrete, line-by-line migration patterns from VisionPilot's ROS2 stack to DoraPilot's DORA-native architecture.
 
-**Key constraint:** DoraPilot is **Python-only**. All nodes, operators, and algorithms are implemented in Python. No C++ nodes, no CMake, no Rust required for application code. DORA's Python API is first-class and production-ready.
-
-**Key insight from dora-autoware.universe:** The migration is **not a rewrite**. It is a **repackaging**:
-- ROS2 `Node` class → DORA `Operator` class or Python `Node` class
-- `create_subscription()` / `create_publisher()` → `dataflow.yml` input/output declarations
-- `sensor_msgs/Image` → `pyarrow.Array` (numpy buffer view)
+**Key principle:** The migration is **not a rewrite**. It is a **repackaging**:
+- Algorithm code stays **unchanged**
+- ROS2 `Node` class → DORA `Node` class
+- `evp_msgs` → `drp_msgs` (same fields, zero compilation)
+- `create_subscription()` / `create_publisher()` → `dataflow.yml` declarations
 - `launch/*.launch.py` → `dataflow.yml`
-- Service-based HAL (`/system/inference/infer`) → DORA node with direct outputs
+
+**Key constraint:** Python-only. No C++ nodes, no CMake, no `colcon build`.
 
 ---
 
-## 1. Migration Pattern: ROS2 Node → DORA Operator/Node
+## 1. Migration Pattern: ROS2 Node → DORA Node
 
 ### 1.1 ROS2 Python Node (VisionPilot Style)
-
-**Source:** `visionpilot/src/perception/driving_model/driving_model/driving_model_node.py`
 
 ```python
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Path
+from evp_msgs.msg import DetectedObjectArray
 from cv_bridge import CvBridge
 
 class DrivingModelNode(Node):
     def __init__(self):
         super().__init__('driving_model')
-        
-        # Parameters
         self.declare_parameter('model_path', '/data/models/driving_vision.rknn')
-        self.declare_parameter('inference_rate_hz', 20.0)
-        
-        # Subscribers
+
         self.sub_image = self.create_subscription(
             Image,
             '/sensing/mono_narrow_preprocessor/image_processed',
-            self._on_image,
-            10
+            self._on_image, 10
         )
-        
-        # Publishers
         self.pub_path = self.create_publisher(Path, '/perception/driving_model/path', 10)
         self.pub_leads = self.create_publisher(DetectedObjectArray, '/perception/driving_model/leads', 10)
-        
-        # Timer
         self.timer = self.create_timer(1.0/20.0, self._inference_loop)
-        
         self.bridge = CvBridge()
         self.latest_image = None
-    
+
     def _on_image(self, msg):
         self.latest_image = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-    
+
     def _inference_loop(self):
         if self.latest_image is None:
             return
         # ... NPU inference ...
         path_msg = Path()
-        # ... populate ...
         self.pub_path.publish(path_msg)
 ```
 
-### 1.2 DORA Python Operator (DoraPilot Style)
-
-**Reference:** `autoware.universe/peception/yolo/object_detection_yolov5.py`
-
-```python
-import cv2
-import numpy as np
-import pyarrow as pa
-from dora import DoraStatus
-
-class Operator:
-    """DORA operator — runs in-process, lightweight transform."""
-    
-    def __init__(self):
-        # No ROS init needed. DORA runtime handles lifecycle.
-        self.model = load_rknn_model('/data/models/driving_vision.rknn', core_id=0)
-    
-    def on_event(self, dora_event, send_output) -> DoraStatus:
-        if dora_event["type"] == "INPUT":
-            return self.on_input(dora_event, send_output)
-        return DoraStatus.CONTINUE
-    
-    def on_input(self, dora_input, send_output):
-        # Input arrives as PyArrow Array — zero-copy numpy view
-        frame = dora_input["value"].to_numpy().reshape((256, 512, 3))
-        
-        # NPU inference
-        outputs = self.model.infer(frame)
-        
-        # Output as PyArrow arrays
-        path_array = pa.array(parse_path(outputs).ravel())
-        leads_array = pa.array(parse_leads(outputs).ravel())
-        
-        send_output("path", path_array, dora_input["metadata"])
-        send_output("leads", leads_array, dora_input["metadata"])
-        
-        return DoraStatus.CONTINUE
-```
-
-### 1.3 DORA Python Node (For isolated heavy compute)
-
-**Use case:** NPU inference nodes, MPC solvers, or any node that must crash in isolation.
+### 1.2 DORA Python Node (Dorapilot Style)
 
 ```python
 from dora import Node
-import pyarrow as pa
-import numpy as np
-import json
+from drp_msgs import Image, Path, DetectedObjectArray
+from drp_msgs.utils import to_arrow, from_arrow
 
-class NdtLocalizerNode:
-    """DORA Python node — standalone process, isolated from others."""
-    
+class DrivingVisionNode:
     def __init__(self):
         self.node = Node()
-        self.ndt = load_ndt_solver()      # Reuse your Python algorithm
-        self.map_loader = load_pcd_map()  # Reuse your Python map loader
-    
+        self.model = self._load_model()
+
+    def _load_model(self):
+        model_path = self.node.env.get("MODEL_PATH", "/data/models/driving_vision.rknn")
+        # ... load RKNN ...
+        return model
+
     def run(self):
         for event in self.node:
             if event["type"] == "INPUT":
                 self.on_input(event)
             elif event["type"] == "STOP":
                 break
-    
+
     def on_input(self, event):
-        # Receive raw bytes — same memory layout as ROS2 PointCloud2
-        data = event["value"].to_numpy().view(np.uint8)
-        
-        # Parse pointcloud in Python (numpy vectorized)
-        points = parse_pointcloud_bytes(data)  # Your existing Python parser
-        
-        # Run NDT — reuse existing Python/NumPy algorithm
-        result = self.ndt.align(points)
-        
-        if result.is_converged:
-            # Serialize pose to JSON for cross-language compatibility
-            pose_json = json.dumps({
-                "pose": {
-                    "position": {
-                        "x": result.pose.position.x,
-                        "y": result.pose.position.y,
-                        "z": result.pose.position.z,
-                    },
-                    "orientation": {
-                        "x": result.pose.orientation.x,
-                        "y": result.pose.orientation.y,
-                        "z": result.pose.orientation.z,
-                        "w": result.pose.orientation.w,
-                    }
-                }
-            })
-            self.node.send_output("resultpose", pa.array([pose_json]))
+        # Deserialize drp_msgs Image from Arrow
+        image = from_arrow(event["value"], Image)
+        frame = image.to_numpy()  # or cv2 for bgr/rgb
+
+        # ... NPU inference (UNCHANGED algorithm) ...
+        path, leads = self.model.infer(frame)
+
+        # Serialize drp_msgs to Arrow and send
+        self.node.send_output("neural_path", to_arrow(Path(header=image.header, poses=path)))
+        self.node.send_output("leads", to_arrow(DetectedObjectArray(header=image.header, objects=leads)))
 
 if __name__ == "__main__":
-    node = NdtLocalizerNode()
-    node.run()
+    DrivingVisionNode().run()
 ```
 
-**Dataflow declaration (YAML):**
-```yaml
-nodes:
-  - id: ndt_localizer
-    path: src/localization/ndt_localizer_node/ndt_localizer_node.py
-    inputs:
-      pointcloud: lidar/pointcloud
-    outputs:
-      - resultpose
-    env:
-      MAP_PATH: /data/maps/current.pcd
-      RESOLUTION: "1.0"
-```
+### 1.3 DORA Python Operator (Lightweight, In-Process)
 
-**No build step needed.** DORA runs Python files directly.
+Use operators for preprocessing, filtering, PID control — anything lightweight and stateless.
+
+```python
+from dora import DoraStatus
+from drp_msgs import Image, PointCloud2
+from drp_msgs.utils import to_arrow, from_arrow
+
+class Operator:
+    def __init__(self):
+        self.target_w = 512
+        self.target_h = 256
+
+    def on_event(self, dora_event, send_output):
+        if dora_event["type"] == "INPUT":
+            return self.on_input(dora_event, send_output)
+        return DoraStatus.CONTINUE
+
+    def on_input(self, dora_input, send_output):
+        image = from_arrow(dora_input["value"], Image)
+        frame = image.to_numpy()
+
+        # RGA hardware resize (or OpenCV fallback)
+        resized = cv2.resize(frame, (self.target_w, self.target_h))
+
+        result = Image.from_numpy(resized, header=image.header)
+        send_output("image_resized", to_arrow(result))
+        return DoraStatus.CONTINUE
+```
 
 ---
 
 ## 2. Migration Pattern: ROS2 Launch → DORA Dataflow YAML
 
-### 2.1 VisionPilot Launch File (ROS2)
-
-**Source:** `visionpilot/src/launch/visionpilot_launch/launch/perception.launch.py`
+### 2.1 VisionPilot Launch File
 
 ```python
 from launch import LaunchDescription
@@ -202,54 +145,39 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        Node(
-            package='driving_model',
-            executable='driving_model_node',
-            name='driving_model',
-            parameters=[{'model_path': '/data/models/driving_vision.rknn'}],
-            remappings=[
-                ('image_raw', '/sensing/mono_narrow_preprocessor/image_processed'),
-            ]
-        ),
-        Node(
-            package='lane_detector',
-            executable='lane_detector_node',
-            name='lane_detector',
-            parameters=[{'model_path': '/data/models/lane_detector.rknn'}],
-        ),
-        Node(
-            package='perception_fusion',
-            executable='perception_fusion_node',
-            name='perception_fusion',
-        ),
+        Node(package='driving_model', executable='driving_model_node',
+             name='driving_model',
+             parameters=[{'model_path': '/data/models/driving_vision.rknn'}],
+             remappings=[('image_raw', '/sensing/mono_narrow_preprocessor/image_processed')]),
+        Node(package='lane_detector', executable='lane_detector_node',
+             name='lane_detector',
+             parameters=[{'model_path': '/data/models/lane_detector.rknn'}]),
+        Node(package='perception_fusion', executable='perception_fusion_node',
+             name='perception_fusion'),
     ])
 ```
 
 ### 2.2 DORA Dataflow YAML
 
-**Reference:** `autoware.universe/peception/yolo/dataflow_yolo.yaml`
-
 ```yaml
-# dorapilot/perception/dataflow.yml
 nodes:
-  # Camera preprocess (operator — lightweight, in-process)
   - id: image_preprocess
-    operator:
-      python: operators/image_preprocess.py
-      inputs:
-        image_raw: camera/image_raw
-      outputs:
-        - image_processed
+    operators:
+      python: src/sensing/operators/image_preprocess.py
+    inputs:
+      image_raw: camera/image_raw
+    outputs:
+      - image_resized
+      - image_yuv
     env:
-      RESIZE_WIDTH: 512
-      RESIZE_HEIGHT: 256
+      RESIZE_WIDTH: "512"
+      RESIZE_HEIGHT: "256"
       USE_RGA: "true"
 
-  # Driving vision (node — isolated process, NPU heavy)
   - id: driving_vision
-    path: src/perception/driving_vision_node/driving_vision_node.py
+    path: src/perception/driving_vision/driving_vision_node.py
     inputs:
-      image: image_preprocess/image_processed
+      image: image_preprocess/image_yuv
     outputs:
       - features
       - engagement
@@ -259,25 +187,25 @@ nodes:
     restart_policy: on_failure
     max_restarts: 3
 
-  # Lane detection (node — isolated process, NPU heavy)
   - id: lane_detector
-    path: src/perception/lane_detector_node/lane_detector_node.py
+    path: src/perception/lane_detector/lane_detector_node.py
     inputs:
-      image: image_preprocess/image_processed
+      image: image_preprocess/image_resized
     outputs:
       - lane_lines
     env:
       MODEL_PATH: /data/models/lane_detector_rk3688.rknn
       NPU_CORE: "1"
 
-  # Perception fusion (node — CPU, combines all inputs)
   - id: perception_fusion
-    path: src/perception/perception_fusion_node/perception_fusion_node.py
+    path: src/perception/perception_fusion/perception_fusion_node.py
     inputs:
-      features: driving_vision/features
+      neural_path: driving_vision/neural_path
       lane_lines: lane_detector/lane_lines
-      lidar_objects: lidar_perception/objects_3d
+      lidar_objects: lidar_detector/objects_3d
       safety_events: safety_perception/safety_events
+      gnss_fix: gnss/navsatfix
+      imu_raw: imu/imu_data
     outputs:
       - perception_context
 ```
@@ -287,49 +215,76 @@ nodes:
 | Aspect | ROS2 Launch | DORA Dataflow |
 |--------|-------------|---------------|
 | **Definition** | Python code | Declarative YAML |
-| **Node type** | All are processes | `operator` (in-process) or `custom` (standalone) |
+| **Node type** | All processes | `path` (standalone) or `operators` (in-process) |
 | **Connections** | Topic remappings | `input: node_id/output_id` |
-| **Parameters** | `parameters=[{}]` | `env:` or `params:` |
-| **Timing** | External timer nodes | `dora/timer/millis/N` or `dora/timer/hz/N` |
+| **Parameters** | `parameters=[{}]` | `env:` dictionary |
+| **Timing** | Timer nodes | `dora/timer/millis/N` |
 | **Restart** | systemd externally | `restart_policy:` inline |
+| **Build** | `colcon build` required | No build — direct execution |
 
 ---
 
-## 3. Migration Pattern: ROS2 Messages → PyArrow Arrays
+## 3. Migration Pattern: evp_msgs → drp_msgs
 
-### 3.1 Image Message
+### 3.1 The Core Change
 
-**ROS2:**
+| VisionPilot | Dorapilot |
+|-------------|-----------|
+| `evp_msgs/msg/*.msg` files | `src/drp_msgs/*.py` Python dataclasses |
+| `rosidl_generate_interfaces` build | Zero compilation — import and use |
+| `from evp_msgs.msg import X` | `from drp_msgs import X` |
+| CDR serialization | PyArrow zero-copy |
+
+### 3.2 Message Mapping
+
+| VisionPilot (`evp_msgs`) | Dorapilot (`drp_msgs`) |
+|--------------------------|------------------------|
+| `evp_msgs.msg.EgoState` | `drp_msgs.perception_msgs.PerceptionContext` |
+| `evp_msgs.msg.DetectedObjectArray` | `drp_msgs.perception_msgs.DetectedObjectArray` |
+| `evp_msgs.msg.DetectedObject` | `drp_msgs.perception_msgs.DetectedObject` |
+| `evp_msgs.msg.NeuralPath` | `drp_msgs.planning_msgs.Trajectory` |
+| `evp_msgs.msg.NeuralPathPoint` | `drp_msgs.planning_msgs.TrajectoryPoint` |
+| `evp_msgs.msg.ControlCommand` | `drp_msgs.vehicle_msgs.VehicleCommand` |
+| `std_msgs.msg.Header` | `drp_msgs.std_msgs.Header` |
+| `geometry_msgs.msg.Point` | `drp_msgs.geometry_msgs.Point` |
+| `geometry_msgs.msg.Quaternion` | `drp_msgs.geometry_msgs.Quaternion` |
+| `geometry_msgs.msg.Pose` | `drp_msgs.geometry_msgs.Pose` |
+| `sensor_msgs.msg.Image` | `drp_msgs.sensor_msgs.Image` |
+| `sensor_msgs.msg.PointCloud2` | `drp_msgs.sensor_msgs.PointCloud2` |
+| `sensor_msgs.msg.Imu` | `drp_msgs.sensor_msgs.Imu` |
+| `sensor_msgs.msg.NavSatFix` | `drp_msgs.sensor_msgs.NavSatFix` |
+| `nav_msgs.msg.Path` | `drp_msgs.nav_msgs.Path` |
+| `nav_msgs.msg.Odometry` | `drp_msgs.nav_msgs.Odometry` |
+
+### 3.3 Image Message
+
+**ROS2 (VisionPilot):**
 ```python
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 bridge = CvBridge()
-msg = Image()
-msg.height = 256
-msg.width = 512
-msg.encoding = 'rgb8'
-msg.data = frame.tobytes()
-
-# Subscribe
+msg = Image(height=256, width=512, encoding='rgb8', data=frame.tobytes())
 frame = bridge.imgmsg_to_cv2(msg, 'rgb8')
 ```
 
-**DORA (Reference: autoware.universe/dora-hardware/vendors/camera/OpenCV/webcam.py):**
+**DORA (Dorapilot with drp_msgs):**
 ```python
-import pyarrow as pa
-import numpy as np
+from drp_msgs import Image
+from drp_msgs.utils import to_arrow, from_arrow
 
 # Publish
-send_output("image", pa.array(frame.ravel().view(np.uint8)), metadata)
+image = Image.from_numpy(frame, header=Header(frame_id="camera"))
+send_output("image", to_arrow(image))
 
 # Subscribe
-frame = dora_input["value"].to_numpy().reshape((256, 512, 3))
+image = from_arrow(event["value"], Image)
+frame = image.to_numpy()  # zero-copy numpy view
 ```
 
-### 3.2 PointCloud2 Message
+### 3.4 PointCloud2 Message
 
-**ROS2:**
+**ROS2 (VisionPilot):**
 ```python
 from sensor_msgs.msg import PointCloud2, PointField
 
@@ -346,84 +301,47 @@ msg.row_step = msg.point_step * len(points)
 msg.data = points.tobytes()
 ```
 
-**DORA (Reference: autoware.universe/dora-hardware/dora_to_ros2/lidar/lidar_to_ros2.py):**
+**DORA (Dorapilot with drp_msgs):**
 ```python
-# DORA passes raw bytes directly — no PointField metadata needed
-# The dataflow contract (YAML) defines the schema implicitly
+from drp_msgs import PointCloud2, Header
+from drp_msgs.utils import to_arrow, from_arrow
 
-# Publish
-send_output("pointcloud", pa.array(points.ravel().view(np.uint8)))
+# Publish (from numpy array Nx4)
+pc2 = PointCloud2.from_xyz_array(points, header=Header(frame_id="lidar"))
+send_output("pointcloud", to_arrow(pc2))
 
-# Subscribe (Python node)
-import numpy as np
-
-data = dora_input["value"].to_numpy().view(np.uint8)
-
-# Parse directly — same memory layout as ROS2 PointCloud2
-header_seq = int.from_bytes(data[0:4], 'little')
-header_stamp = int.from_bytes(data[8:16], 'little')
-points = []
-for i in range((len(data) - 16) // 16):
-    offset = 16 + 16 * i
-    x = np.frombuffer(data[offset:offset+4], dtype=np.float32)[0]
-    y = np.frombuffer(data[offset+4:offset+8], dtype=np.float32)[0]
-    z = np.frombuffer(data[offset+8:offset+12], dtype=np.float32)[0]
-    intensity = np.frombuffer(data[offset+12:offset+16], dtype=np.float32)[0]
-    points.append([x, y, z, intensity])
-points = np.array(points, dtype=np.float32)
+# Subscribe
+pc2 = from_arrow(event["value"], PointCloud2)
+points = pc2.to_numpy()  # Nx4 float32 array [x, y, z, intensity]
 ```
 
-**⚠️ Critical:** DORA's ROS2 bridge has known issues with PointCloud2 `Struct array` panics. For dorapilot:
+**⚠️ Critical:** DORA's ROS2 bridge has known issues with PointCloud2 struct arrays. For dorapilot:
 - **Keep LiDAR pipeline 100% DORA-native** — do NOT bridge PointCloud2 to ROS2
-- Bridge only at the end: `trajectory` → `nav_msgs::Path` → ROS2 vehicle controller
+- Use `drp_msgs.PointCloud2` end-to-end within DORA
+- Bridge only at the vehicle boundary with simple structs
 
-### 3.3 Pose/Path Messages
+### 3.5 Pose/Path Messages (ROS2 Bridge)
 
-**DORA → ROS2 Bridge (Reference: autoware.universe/localization/ndt_localizer/src/pose_to_ros2.py):**
+For nodes that MUST publish to ROS2 (vehicle bridge only):
+
 ```python
+from drp_msgs import PoseStamped, Path
+from drp_msgs.utils import to_arrow, from_arrow
 import dora
-import pyarrow as pa
-import numpy as np
 
-class Operator:
-    def __init__(self):
-        self.ros2_context = dora.experimental.ros2_bridge.Ros2Context()
-        self.ros2_node = self.ros2_context.new_node(
-            "path2ros", "/ros2_bridge",
-            dora.experimental.ros2_bridge.Ros2NodeOptions(rosout=True)
-        )
-        self.topic_qos = dora.experimental.ros2_bridge.Ros2QosPolicies(
-            reliable=True, max_blocking_time=0.1
-        )
-        self.path_topic = self.ros2_node.create_topic(
-            "/ros2_bridge/Path_data", "nav_msgs::Path", self.topic_qos
-        )
-        self.path_publisher = self.ros2_node.create_publisher(self.path_topic)
-    
-    def on_input(self, dora_input, send_output):
-        data = dora_input["value"].to_pylist()
-        json_string = ''.join(chr(int(num)) for num in data)
-        pose_dict = json.loads(json_string)
-        
-        ros_path = {
-            'header': {'frame_id': 'map', 'stamp': {'sec': 111, 'nanosec': 222}},
-            'poses': [{
-                'pose': {
-                    'position': {'x': pose_dict['pose']['position']['x'], ...},
-                    'orientation': {'w': pose_dict['pose']['orientation']['w'], ...}
-                }
-            }]
-        }
-        self.path_publisher.publish(pa.array([ros_path]))
+# Inside bridge node: convert drp_msgs → ROS2-compatible dict
+path = Path(header=Header(frame_id="map"), poses=[...])
+ros2_dict = path.to_dict()  # ROS2-compatible structure
+
+# Publish via DORA ROS2 bridge
+publisher.publish(pa.array([ros2_dict]))
 ```
 
 ---
 
-## 4. Migration Pattern: ROS2 Services → DORA Nodes/Outputs
+## 4. Migration Pattern: ROS2 Services → DORA Nodes
 
-### 4.1 VisionPilot Inference Service (ROS2)
-
-**Source:** `visionpilot/src/system/inference/inference/inference_node.py`
+### 4.1 VisionPilot Inference Service
 
 ```python
 from rclpy.node import Node
@@ -434,7 +352,7 @@ class InferenceNode(Node):
         super().__init__('inference')
         self.srv_load = self.create_service(LoadModel, '/system/inference/load_model', self._handle_load)
         self.srv_infer = self.create_service(RunInference, '/system/inference/infer', self._handle_infer)
-    
+
     def _handle_infer(self, request, response):
         backend = self.backends[request.backend]
         outputs = backend.infer(request.model_id, request.input_data)
@@ -444,10 +362,9 @@ class InferenceNode(Node):
 
 ### 4.2 DORA Inference Daemon
 
-In DORA, service-like request/response is replaced by **dataflow connections**. The inference daemon becomes a node with inputs and outputs:
+In DORA, request/response becomes dataflow connections:
 
 ```yaml
-# system/dataflow.yml
 nodes:
   - id: inference_daemon
     path: src/system/inference_daemon/inference_daemon.py
@@ -460,18 +377,18 @@ nodes:
       NPU_CORE_1_MODELS: "lane_detector,lidar_perception"
 ```
 
-**Python client pattern (inside perception node):**
+**Client pattern (inside perception node):**
 ```python
 # Instead of: client.call_async(request)
-# DORA perception node sends inference request as output
-send_output("infer_request", pa.array(preprocessed_image.ravel()))
+# Send inference request as output
+send_output("infer_request", to_arrow(infer_request))
 
-# And receives result as input in next on_input call
-if dora_input["id"] == "infer_result":
-    result = dora_input["value"].to_numpy()
+# Receive result as input
+if event["id"] == "infer_result":
+    result = from_arrow(event["value"], InferResult)
 ```
 
-**Key difference:** ROS2 services are synchronous request/response. DORA is **always asynchronous dataflow**. If you need synchronous behavior, buffer the request and match on response ID.
+**Key difference:** ROS2 services are synchronous request/response. DORA is **always asynchronous dataflow**.
 
 ---
 
@@ -479,199 +396,155 @@ if dora_input["id"] == "infer_result":
 
 ### 5.1 Sensing Layer
 
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `camera_driver` (ROS2 Node) | `camera_node` (Operator) | `autoware.universe/dora-hardware/vendors/camera/OpenCV/webcam.py` | Use OpenCV capture, output PyArrow array |
-| `hesai_driver` (ROS2 Node) | `lidar_node` (Python Node) | `autoware.universe/dora-hardware/vendors/lidar/dataflow.yml` | Raw bytes output, 16-byte header + point data |
-| `image_preprocessor` (ROS2 Node) | `image_preprocess` (Operator) | `autoware.universe/peception/yolo/webcam.py` | In-process RGA resize, zero overhead |
-| `stereo_matcher` (ROS2 Node) | `stereo_node` (Python Node) | — | Python OpenCV SGM or NumPy-based stereo |
-| `sensing_quality` (ROS2 Node) | `quality_operator` (Operator) | — | Lightweight analysis, in-process |
-
-**Dataflow:**
-```yaml
-nodes:
-  - id: camera
-    operator:
-      python: src/sensing/operators/camera_op.py
-      inputs:
-        tick: dora/timer/millis/33
-      outputs:
-        - image_raw
-
-  - id: image_preprocess
-    operator:
-      python: src/sensing/operators/image_preprocess.py
-      inputs:
-        image_raw: camera/image_raw
-      outputs:
-        - image_processed
-```
+| VisionPilot (ROS2) | Dorapilot (DORA) | Notes |
+|-------------------|------------------|-------|
+| `camera_driver` | `camera/camera_node.py` | V4L2 capture, outputs `drp_msgs.Image` |
+| `hesai_driver` | `lidar/lidar_node.py` | Pandar QT64, outputs `drp_msgs.PointCloud2` |
+| `image_preprocessor` | `operators/image_preprocess.py` | In-process operator, zero overhead |
+| `stereo_matcher` | `stereo/stereo_node.py` | Python OpenCV SGM |
+| `sensing_quality` | `operators/quality_operator.py` | Lightweight operator |
 
 ### 5.2 Perception Layer
 
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `driving_model` (ROS2 Node) | `driving_vision_node` (Custom Node) | `autoware.universe/peception/yolo/object_detection_yolov5.py` | NPU inference, isolated process |
-| `lane_detector` (ROS2 Node) | `lane_detector_node` (Custom Node) | — | Same pattern as driving_vision |
-| `lidar_detector` (ROS2 Node) | `lidar_perception_node` (Custom Node) | — | PointPillars on NPU Core 1 |
-| `perception_fusion` (ROS2 Node) | `perception_fusion_node` (Custom Node) | — | Multi-input, CPU-based |
-| `object_tracker` (ROS2 Node) | `tracker_operator` (Operator) | — | Kalman filter as lightweight operator |
-| `crop_box_filter` (ROS2 Node) | `filter_operators` (Operator) | — | In-process voxel + crop box |
-| `voxel_grid_filter` (ROS2 Node) | merged into `filter_operators` | — | No separate package needed |
+| VisionPilot (ROS2) | Dorapilot (DORA) | Notes |
+|-------------------|------------------|-------|
+| `driving_model` | `driving_vision/driving_vision_node.py` | NPU Core 0, isolated process |
+| `lane_detector` | `lane_detector/lane_detector_node.py` | NPU Core 1 |
+| `lidar_detector` | `lidar_detector/lidar_detector_node.py` | PointPillars on NPU |
+| `perception_fusion` | `perception_fusion/perception_fusion_node.py` | Outputs `PerceptionContext` |
+| `object_tracker` | `tracker_operator.py` | Kalman filter operator |
+| `crop_box_filter` | `operators/pointcloud_filter.py` | Voxel + crop box operator |
+| `voxel_grid_filter` | merged into `pointcloud_filter.py` | No separate package |
 
 ### 5.3 Planning Layer
 
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `behavior_planner` (ROS2 Node) | `behavior_planner_node` (Python Node) | — | Python logic |
-| `trajectory_planner` (ROS2 Node) | `trajectory_planner_node` (Python Node) | — | ACADOS Python interface + generated C solver |
-| `velocity_smoother` (ROS2 Node) | `smoother_operator` (Operator) | — | In-process filter |
-| `trajectory_comparator` (ROS2 Node) | `trajectory_selector_node` (Python Node) | — | Selects best trajectory |
+| VisionPilot (ROS2) | Dorapilot (DORA) | Notes |
+|-------------------|------------------|-------|
+| `behavior_planner` | `behavior_planner/behavior_planner_node.py` | Consumes `PerceptionContext` |
+| `trajectory_planner` | `trajectory_planner/trajectory_planner_node.py` | ACADOS Python interface |
+| `velocity_smoother` | `operators/smoother_operator.py` | In-process filter |
+| `trajectory_comparator` | `trajectory_selector/trajectory_selector_node.py` | Selects best trajectory |
 
 ### 5.4 Control Layer
 
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `vehicle_controller` (ROS2 Node) | `controller_node` (Custom Node) | — | 100Hz control loop |
-| `trajectory_follower` (ROS2 Node) | `follower_operator` (Operator) | — | In-process path tracking |
-| `lat_control_torque` (ROS2 Node) | `lateral_pid_operator` (Operator) | — | In-process PID |
-| `long_control` (ROS2 Node) | `longitudinal_pid_operator` (Operator) | — | In-process PID |
+| VisionPilot (ROS2) | Dorapilot (DORA) | Notes |
+|-------------------|------------------|-------|
+| `vehicle_controller` | `controller/controller_node.py` | 100Hz PID node |
+| `trajectory_follower` | `operators/follower_operator.py` | In-process path tracking |
+| `lat_control_torque` | `operators/lateral_pid_operator.py` | In-process PID |
+| `long_control` | `operators/longitudinal_pid_operator.py` | In-process PID |
 
-### 5.5 System Layer
+### 5.5 Localization Layer
 
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `inference_ecu` (ROS2 Service Node) | `inference_daemon` (Custom Node) | — | Exposes NPU/GPU/RGA via outputs |
-| `camera_daemon` (ROS2 Node) | `camera_daemon` (Custom Node) | — | V4L2/ISP hardware management |
-| `thermal` (ROS2 Node) | `thermal_daemon` (Operator) | — | Lightweight monitoring |
-| `health_monitor` (ROS2 Node) | `health_daemon` (Operator) | — | System health telemetry |
-
-### 5.6 Localization Layer
-
-| VisionPilot (ROS2) | DoraPilot (DORA) | Reference | Notes |
-|-------------------|------------------|-----------|-------|
-| `ekf_localizer` (ROS2 Node) | `ekf_localizer_node` (Python Node) | `autoware.universe/localization/ekf_localizer/dataflow.yml` | Python filterpy or NumPy EKF |
-| `ndt_localizer` (ROS2 Node) | `ndt_localizer_node` (Python Node) | — | Python open3d or pyntcloud NDT |
-| `gnss_localizer` (ROS2 Node) | `gnss_poser` (Python Node) | `autoware.universe/sensing/gnss_poser/dataflow.yml` | GNSS → pose, Python geodesy |
+| VisionPilot (ROS2) | Dorapilot (DORA) | Notes |
+|-------------------|------------------|-------|
+| `ekf_localizer` | `ekf_localizer/ekf_localizer_node.py` | Python filterpy/numpy EKF |
+| `ndt_localizer` | `ndt_localizer/ndt_localizer_node.py` | Python NDT (open3d/pyntcloud) |
+| `gnss_localizer` | `gnss_poser/gnss_poser_node.py` | GNSS → pose |
 
 ---
 
-## 6. Concrete Example: Localization Node Migration (Python-Only)
+## 6. Concrete Example: Perception Fusion Node Migration
 
-This example shows how to migrate a ROS2 localization node to DORA using **pure Python**.
+This example shows migrating VisionPilot's perception fusion to DORA using **drp_msgs**.
 
 ### 6.1 Original ROS2 Node (Conceptual)
 
 ```python
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2
-from geometry_msgs.msg import PoseStamped
+from evp_msgs.msg import EgoState, DetectedObjectArray, NeuralPath
+from sensor_msgs.msg import Image
 
-class LocalizerNode(Node):
+class PerceptionFusionNode(Node):
     def __init__(self):
-        super().__init__('localizer')
-        self.sub = self.create_subscription(PointCloud2, '/sensing/lidar/points', self.on_cloud, 10)
-        self.pub = self.create_publisher(PoseStamped, '/localization/pose', 10)
-        self.map = load_map()  # Your existing Python map loader
-    
-    def on_cloud(self, msg):
-        points = pointcloud2_to_numpy(msg)  # Your existing Python parser
-        pose = self.ndt_align(points)         # Your existing Python algorithm
-        self.pub.publish(pose)
+        super().__init__('perception_fusion')
+        self.sub_objects = self.create_subscription(DetectedObjectArray, '/perception/objects', self.on_objects, 10)
+        self.sub_path = self.create_subscription(NeuralPath, '/perception/neural_path', self.on_path, 10)
+        self.pub_ego = self.create_publisher(EgoState, '/perception/ego_state', 10)
+
+    def on_objects(self, msg):
+        self.latest_objects = msg
+
+    def on_path(self, msg):
+        self.latest_path = msg
+        ego = self.fuse(self.latest_objects, self.latest_path)
+        self.pub_ego.publish(ego)
 ```
 
-### 6.2 Migrated DORA Python Node
+### 6.2 Migrated DORA Node
 
-**File:** `src/localization/localizer_node/localizer_node.py`
+**File:** `src/perception/perception_fusion/perception_fusion_node.py`
 
 ```python
 from dora import Node
-import pyarrow as pa
-import numpy as np
-import json
+from drp_msgs import (
+    PerceptionContext, DetectedObjectArray, Trajectory,
+    LeadVehicle, LaneLineArray, Header
+)
+from drp_msgs.utils import to_arrow, from_arrow
 
-class LocalizerNode:
-    """DORA Python node — standalone process. Algorithm code is untouched."""
-    
+class PerceptionFusionNode:
     def __init__(self):
         self.node = Node()
-        self.map = load_map()  # Your existing Python map loader — UNCHANGED
-    
+        self.latest_objects = DetectedObjectArray()
+        self.latest_path = Trajectory()
+        self.latest_lane_lines = LaneLineArray()
+
     def run(self):
         for event in self.node:
             if event["type"] == "INPUT":
                 self.on_input(event)
             elif event["type"] == "STOP":
                 break
-    
+
     def on_input(self, event):
-        # Parse pointcloud from raw bytes — same layout as ROS2 PointCloud2
-        data = event["value"].to_numpy().view(np.uint8)
-        points = parse_pointcloud_bytes(data)  # Your existing parser — UNCHANGED
-        
-        # Run algorithm — EXACT same call as ROS2 node
-        pose = self.ndt_align(points)  # Your existing algorithm — UNCHANGED
-        
-        # Serialize pose to JSON for downstream nodes
-        pose_json = json.dumps({
-            "pose": {
-                "position": {"x": pose.x, "y": pose.y, "z": pose.z},
-                "orientation": {"x": pose.qx, "y": pose.qy, "z": pose.qz, "w": pose.qw}
-            }
-        })
-        self.node.send_output("pose", pa.array([pose_json]))
+        if event["id"] == "objects_3d":
+            self.latest_objects = from_arrow(event["value"], DetectedObjectArray)
+        elif event["id"] == "neural_path":
+            self.latest_path = from_arrow(event["value"], Trajectory)
+        elif event["id"] == "lane_lines":
+            self.latest_lane_lines = from_arrow(event["value"], LaneLineArray)
+
+        # Fuse when all inputs available
+        if self.latest_objects.objects and self.latest_path.points:
+            ctx = self.fuse()
+            self.node.send_output("perception_context", to_arrow(ctx))
+
+    def fuse(self) -> PerceptionContext:
+        """Fusion logic — UNCHANGED from VisionPilot."""
+        lead = self._extract_lead(self.latest_objects)
+        return PerceptionContext(
+            header=Header(frame_id="base_link"),
+            lead=lead,
+            lane_lines=self.latest_lane_lines,
+            objects_3d=self.latest_objects,
+            speed_limit_mps=16.67,
+            road_condition="dry"
+        )
+
+    def _extract_lead(self, objects: DetectedObjectArray) -> LeadVehicle:
+        # ... same logic as VisionPilot ...
+        pass
 
 if __name__ == "__main__":
-    node = LocalizerNode()
-    node.run()
+    PerceptionFusionNode().run()
 ```
 
-### 6.3 Dataflow YAML
-
-**File:** `dataflows/localization.yml`
-
-```yaml
-nodes:
-  # LiDAR driver (Python node)
-  - id: lidar_driver
-    path: src/sensing/lidar_node/lidar_node.py
-    inputs:
-      tick: dora/timer/millis/100
-    outputs:
-      - pointcloud
-
-  # Localizer (Python node)
-  - id: localizer
-    path: src/localization/localizer_node/localizer_node.py
-    inputs:
-      pointcloud: lidar_driver/pointcloud
-    outputs:
-      - pose
-    env:
-      MAP_PATH: /data/maps/current.pcd
-
-  # ROS2 bridge (Python operator)
-  - id: pose_bridge
-    operator:
-      python: src/localization/operators/pose_to_ros2.py
-      inputs:
-        pose: localizer/pose
-```
-
-### 6.4 Migration Takeaway
+### 6.3 Migration Takeaway
 
 > **Algorithm code is untouched.** The only changes are:
 > 1. Replace `rclpy.Node` with `dora.Node`
-> 2. Replace `create_subscription()` with `for event in self.node:`
-> 3. Replace `publish()` with `self.node.send_output()`
-> 4. Replace ROS2 msg serialization with PyArrow arrays or JSON strings
+> 2. Replace `evp_msgs.msg.X` with `drp_msgs.X`
+> 3. Replace `create_subscription()` with `for event in self.node:`
+> 4. Replace `publish()` with `self.node.send_output()`
+> 5. Replace CDR serialization with `to_arrow()` / `from_arrow()`
 
-This is a **wrapper migration**, not a rewrite. No C++ needed.
+This is a **wrapper migration**, not a rewrite.
 
 ---
 
-## 7. Migration Pattern: ROS2 Parameters → DORA Environment/Params
+## 7. Migration Pattern: ROS2 Parameters → DORA Environment
 
 ### 7.1 VisionPilot Parameters
 
@@ -681,7 +554,6 @@ self.declare_parameters(namespace='', parameters=[
     ('model_path', '/data/models/driving_vision.rknn'),
     ('inference_rate_hz', 20.0),
     ('npu_core_id', 0),
-    ('debug', False),
 ])
 
 # Usage
@@ -691,37 +563,30 @@ model_path = self.get_parameter('model_path').value
 ### 7.2 DORA Parameters
 
 ```yaml
-# In dataflow.yml
 nodes:
   - id: driving_vision
-    custom:
-      source: build/driving_vision_node
-      inputs:
-        image: image_preprocess/image_processed
-      outputs:
-        - features
+    path: src/perception/driving_vision/driving_vision_node.py
+    inputs:
+      image: image_preprocess/image_yuv
+    outputs:
+      - features
     env:
       MODEL_PATH: /data/models/driving_vision_rk3688.rknn
       INFERENCE_RATE_HZ: "20"
       NPU_CORE_ID: "0"
-      DEBUG: "false"
 ```
 
 ```python
 # In node code
-import os
-
-model_path = os.environ.get("MODEL_PATH", "/data/models/default.rknn")
-npu_core = int(os.environ.get("NPU_CORE_ID", "0"))
+model_path = self.node.env.get("MODEL_PATH", "/data/models/default.rknn")
+npu_core = int(self.node.env.get("NPU_CORE_ID", "0"))
 ```
-
-**For runtime parameter updates:** DORA supports `dora param set <node> <key> <value>` but this is best-effort. For safety-critical parameters, use YAML + restart.
 
 ---
 
 ## 8. Build System Migration
 
-### 8.1 VisionPilot Build (colcon)
+### 8.1 VisionPilot Build
 
 ```bash
 cd ~/visionpilot_ws
@@ -729,21 +594,18 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-### 8.2 DoraPilot Build
-
-**Python nodes:** No build needed. DORA runs them directly.
+### 8.2 Dorapilot Build
 
 ```bash
-# Install DORA CLI and Python API
-cargo install dora-cli
+# Install DORA CLI and Python API (one-time)
 pip install dora-rs numpy pyarrow
 
-# Run dataflow (DORA handles Python deps automatically)
-cd ~/dorapilot
+# Run dataflow — no build step
+cd ~/pilot/dorapilot
 dora run dataflows/dorapilot_main.yml
 ```
 
-**No colcon, no CMake, no package.xml, no setup.py, no C++ compilation** for DORA-native components. Pure Python + YAML.
+**No colcon, no CMake, no package.xml, no setup.py, no C++ compilation.** Pure Python + YAML.
 
 ---
 
@@ -759,7 +621,7 @@ ros2 bag record /sensing/camera/image_raw /sensing/lidar/points
 ros2 bag play bag_file/
 ```
 
-### 9.2 DoraPilot Testing
+### 9.2 Dorapilot Testing
 
 ```bash
 # Record
@@ -778,20 +640,18 @@ dora replay test_drive.drec --assert
 
 ## 10. Checklist: Migrating a Single VisionPilot Node
 
-Use this checklist for each node migration:
-
-- [ ] **Identify node type**: Operator (lightweight) or Custom Node (heavy compute/isolation)?
 - [ ] **Copy algorithm code**: Reuse Python implementation unchanged
-- [ ] **Replace ROS2 imports**: Remove `rclpy`, `std_msgs`, `sensor_msgs`
-- [ ] **Add DORA imports**: `from dora import DoraStatus` or `from dora import Node`
-- [ ] **Replace init**: `rclpy.init()` → DORA runtime init (implicit for operators, `Node()` for Python nodes)
-- [ ] **Replace subscribers**: `create_subscription()` → `on_input()` method or `for event in node:` loop
+- [ ] **Replace ROS2 imports**: Remove `rclpy`, `sensor_msgs`, `evp_msgs`
+- [ ] **Add DORA imports**: `from dora import Node` or `from dora import DoraStatus`
+- [ ] **Add drp_msgs imports**: `from drp_msgs import X` (map from `evp_msgs.msg`)
+- [ ] **Replace init**: `rclpy.init()` → `Node()`
+- [ ] **Replace subscribers**: `create_subscription()` → `for event in node:`
 - [ ] **Replace publishers**: `create_publisher()` + `publish()` → `send_output()`
 - [ ] **Replace timers**: `create_timer()` → `dora/timer/millis/N` in YAML
-- [ ] **Replace parameters**: `declare_parameter()` → `os.environ.get()` from YAML `env:`
-- [ ] **Serialize data**: ROS2 msgs → PyArrow arrays or raw bytes
+- [ ] **Replace parameters**: `declare_parameter()` → `self.node.env.get()`
+- [ ] **Serialize data**: `evp_msgs` → `to_arrow()` / `from_arrow()`
 - [ ] **Add to dataflow.yml**: Declare node ID, inputs, outputs, env
-- [ ] **Test standalone**: `dora run dataflows/test.yml` with just this node
+- [ ] **Test standalone**: `dora run dataflows/test.yml`
 - [ ] **Validate timing**: `dora topic hz <node>/<output>`
 
 ---
@@ -800,13 +660,13 @@ Use this checklist for each node migration:
 
 | Project | Path | What to Learn |
 |---------|------|---------------|
-| **dora-autoware.universe** | `~/pilot/autoware.universe` | Full Autoware port to DORA — NDT, EKF, GNSS, IMU, YOLO (Python API) |
-| **YOLO operator** | `perception/yolo/object_detection_yolov5.py` | Python operator pattern for ML inference |
-| **Camera operator** | `dora-hardware/vendors/camera/OpenCV/webcam.py` | Image capture → PyArrow array |
-| **LiDAR node** | `sensing/lidar_node/lidar_node.py` | Pandar QT64 capture → PyArrow bytes (DORA-native) |
-| **Pose bridge** | `localization/ndt_localizer/pose_to_ros2.py` | DORA → ROS2 bridge pattern (Python) |
-| **Dataflow examples** | `dataflows/dorapilot_main.yml` | YAML syntax for Python nodes and operators |
+| **dora-autoware.universe** | `~/pilot/autoware.universe` | DORA port patterns — NDT, EKF, GNSS, YOLO |
+| **YOLO operator** | `src/perception/yolo/object_detection_yolov5.py` | ML inference operator |
+| **Camera node** | `src/sensing/camera/camera_node.py` | Image capture → drp_msgs.Image |
+| **LiDAR node** | `src/sensing/lidar/lidar_node.py` | Pandar QT64 → drp_msgs.PointCloud2 |
+| **Perception fusion** | `src/perception/perception_fusion/perception_fusion_node.py` | Multi-input fusion with drp_msgs |
+| **Dataflow** | `dataflows/dorapilot_main.yml` | Full pipeline YAML |
 
 ---
 
-*Migration guide v1.0 — 2026-05-30*
+*Migration guide v2.0 — 2026-05-30 — drp_msgs Edition*
