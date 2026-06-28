@@ -753,14 +753,94 @@ No C++ node needed. Generated C solver is a shared library loaded by Python.
 
 ---
 
+## Hardware Platform Notes
+
+### NPU Platform Comparison
+
+DoraPilot supports two NPU families. Current production targets RK3688 (RKNN); Hailo is the planned upgrade path for ExoPilot 05+.
+
+| Feature | RK3688 (current) | Hailo-10H | Hailo-15H (target) |
+|---|---|---|---|
+| AI TOPS | 12 | 10 | 20 |
+| CPU cores | 4× A76 + 4× A55 | 2× A53 | 4× A53 |
+| Camera interface | MIPI CSI-2 (via SoC) | MIPI CSI-2 (1–2 sensors) | MIPI CSI-2 (up to 4 sensors) |
+| ISP | Rockchip ISP2 | Basic ISP | Advanced multi-sensor ISP |
+| Video encode | H.265/H.264, 4K | H.265/H.264, 1080p | H.265/H.264, 4K |
+| Model format | `.rknn` | `.hef` | `.hef` |
+| Power envelope | Higher (full SoC) | Lower | Mid |
+| Best fit | ExoPilot 03/04 | Single-camera IoT | Multi-camera ADAS |
+
+### Hailo-15H: CSI Camera Pipeline
+
+The Hailo-15H is a vision processor SoC — CSI cameras connect directly to it, not through a host CPU. The full pipeline runs on-chip:
+
+```
+MIPI CSI-2 camera(s) → ISP (demosaic, AWB, AE, NR) → Hailo AI Engine (20 TOPS) → H.265 encode / metadata output
+```
+
+**Key points for DoraPilot integration:**
+
+- Supports up to **4 MIPI CSI-2 cameras** simultaneously with hardware frame sync
+- RAW Bayer sensors processed by the on-chip ISP — no host ISP work needed
+- Compatible sensors: Sony IMX series, OmniVision, etc. (standard MIPI CSI-2)
+- Linux driver: V4L2 via Hailo Media Library SDK
+- Output to host: PCIe or GbE, carrying structured inference metadata (not raw frames)
+- Model format: `.hef` — same as Hailo-10H, compiled via Hailo Dataflow Compiler
+
+**DORA node pattern for Hailo-15H** (replaces V4L2 `camera_node.py` + `driving_vision_node.py`):
+
+```python
+# src/sensing/hailo15h/hailo_vision_node.py
+# CSI capture + ISP + inference all happen inside the 15H.
+# This node receives structured output from the Hailo Media Library daemon.
+from hailo_platform import HailoRTClient
+
+class Hailo15HVisionNode:
+    def __init__(self):
+        self.node = Node()
+        self.client = HailoRTClient("/dev/hailo0")  # PCIe device
+        self.client.load_network_group("driving_vision.hef")
+
+    def run(self):
+        for event in self.node:
+            if event["type"] == "INPUT" and event["id"] == "tick":
+                result = self.client.infer()            # CSI→ISP→inference on-chip
+                self.node.send_output("features", to_arrow(result.features))
+                self.node.send_output("engagement", to_arrow(result.engagement))
+```
+
+**Dataflow change for Hailo-15H:** The separate `camera` and `driving_vision` nodes collapse into one `hailo_vision` node. The `image_preprocess` operator is also eliminated — the on-chip ISP handles it.
+
+```yaml
+# dataflows/dorapilot_main_hailo15h.yml (variant)
+nodes:
+  - id: hailo_vision              # replaces: camera + image_preprocess + driving_vision
+    path: src/sensing/hailo15h/hailo_vision_node.py
+    inputs:
+      tick: dora/timer/millis/33
+    outputs: [features, engagement]
+    env:
+      HAILO_DEVICE: /dev/hailo0
+      MODEL_PATH: /data/models/driving_vision.hef
+      CSI_CAMERAS: "0,1"          # use CSI port 0 (front) + port 1 (rear)
+```
+
+### Choosing Between Hailo-15H and Hailo-10H
+
+- **Hailo-15H**: Use for multi-camera ADAS (front + side + rear), 4K capture, or when the full sensing→inference pipeline must run off-host. Recommended for ExoPilot 05+.
+- **Hailo-10H**: Use for single-camera, cost/power-constrained designs where 10 TOPS is sufficient. Not a fit for multi-model parallel inference (driving_vision + lane_detector simultaneously).
+
+---
+
 ## Next Steps
 
 1. **Port inference HAL** from VisionPilot's `system/inference_ecu`
-2. **Implement** camera capture node with V4L2
+2. **Implement** camera capture node with V4L2 (RK3688 path)
 3. **Implement** Pandar QT64 packet parser in `lidar_node.py`
 4. **Port** VisionPilot's driving_vision + driving_policy RKNN inference
 5. **Validate** camera → preprocess → driving_vision pipeline end-to-end
 6. **Benchmark** latency vs VisionPilot on identical hardware
+7. **Prototype** Hailo-15H `hailo_vision_node.py` with front CSI camera
 
 ---
 

@@ -1,0 +1,104 @@
+# DoraPilot Voice Dataflow — Hailo-15H AI voice pipeline
+#
+# Hailo-15H combined AI accelerator (M.2 PCIe Gen3 x4):
+#   - Whisper STT HEF: audio → text (vision AI core)
+#   - LLM HEF: on-device voice reasoning (≤1B params at 20 TOPS)
+#   - Face pose HEF (DMS): runs in safety dataflow, shared Hailo-15H device
+#
+# Flow:
+#   mic → vad → wake_word ──► whisper_stt (Hailo-15H) → nlu → intent
+#                                                                  │
+#                             llm (Hailo-15H) ←── route==llm ─────┤
+#                                                                  │
+#                             piper_tts (CPU) ←── tts_text ────────┘
+
+nodes:
+  # ─── Microphone capture ───────────────────────────────────────────────────────
+  - id: mic
+    path: ../src/sensing/mic/mic_node.py
+    inputs:
+      tick: dora/timer/millis/100        # 100ms audio chunks at 16kHz
+    outputs:
+      - audio_pcm
+    env:
+      MIC_DEVICE: "hw:0,0"
+      MIC_SAMPLE_RATE: "16000"
+      MIC_CHUNK_MS: "100"
+
+  # ─── Voice Activity Detection ─────────────────────────────────────────────────
+  - id: vad
+    path: ../src/voice/vad/vad_node.py
+    inputs:
+      audio_pcm: mic/audio_pcm
+    outputs:
+      - vad_active
+    env:
+      VAD_ENERGY_THRESHOLD: "0.02"
+      VAD_SILENCE_FRAMES: "8"
+
+  # ─── Wake Word Detection (CPU — OpenWakeWord) ─────────────────────────────────
+  - id: wake_word
+    path: ../src/voice/wake_word/wake_word_node.py
+    inputs:
+      audio_pcm: mic/audio_pcm
+    outputs:
+      - wake_event
+    env:
+      WAKE_PHRASE: "hey dora"
+
+  # ─── Whisper STT via Hailo-15H ────────────────────────────────────────────────
+  - id: whisper_stt
+    path: ../src/voice/whisper_stt/whisper_stt_node.py
+    inputs:
+      wake_event: wake_word/wake_event
+      audio_pcm: mic/audio_pcm
+      vad_active: vad/vad_active
+    outputs:
+      - stt_text
+      - stt_active
+    env:
+      WHISPER_HEF: /data/models/whisper_tiny_10s_encoder_hailo15h.hef
+      HAILO_DEVICE: /dev/hailo0
+
+  # ─── NLU — Intent classification (CPU rule-based + LLM routing) ───────────────
+  - id: nlu
+    path: ../src/voice/nlu/nlu_node.py
+    inputs:
+      stt_text: whisper_stt/stt_text
+    outputs:
+      - intent
+
+  # ─── On-device LLM via Hailo-15H (complex queries only) ─────────────────────
+  - id: llm
+    path: ../src/voice/llm/llm_node.py
+    inputs:
+      intent: nlu/intent
+      perception_context: perception_fusion/perception_context
+    outputs:
+      - llm_response
+    env:
+      LLM_MODEL: llama32_1b
+      LLM_DEVICE: hailo15h        # Hailo-15H HEF for ≤1B; fallback=rknn or cpu
+      LLM_MAX_TOKENS: "128"
+      HAILO_DEVICE: /dev/hailo0
+
+  # ─── Intent dispatcher ────────────────────────────────────────────────────────
+  - id: intent_dispatcher
+    path: ../src/voice/intent/intent_node.py
+    inputs:
+      intent: nlu/intent
+      llm_response: llm/llm_response
+    outputs:
+      - adas_cmd
+      - ui_cmd
+      - tts_text
+
+  # ─── TTS output (Piper — CPU) ─────────────────────────────────────────────────
+  - id: piper_tts
+    path: ../src/audio/piper_tts/piper_tts_node.py
+    inputs:
+      tts_text: intent_dispatcher/tts_text
+    env:
+      PIPER_BIN: /usr/local/bin/piper
+      PIPER_MODEL: /data/models/en_US-lessac-medium.onnx
+      TTS_ALSA_DEVICE: "default"

@@ -1,0 +1,98 @@
+# DoraPilot Safety Dataflow — isolated from main pipeline
+# restart_policy: never on all nodes — safety must survive main pipeline restart
+#
+# Inputs consumed from dorapilot_main.yml via shared DORA topics:
+#   perception_context (from perception_fusion)
+#   vehicle_state      (from vehicle_bridge)
+#   hailo_detections   (from hailo15h_daemon — BSD via GMSL2 side cameras)
+#   hailo_dms_output   (from hailo15h_daemon — DMS via USB camera)
+#   driver_attention   (from face_pose_monitor)
+
+nodes:
+  # ─── AEB — Automatic Emergency Braking ───────────────────────────────────────
+  - id: aeb
+    path: ../src/safety/aeb/aeb_node.py
+    inputs:
+      perception_context: perception_fusion/perception_context
+      vehicle_state: vehicle_bridge/vehicle_state
+    outputs:
+      - emergency_brake_request
+    env:
+      AEB_TTC_THRESHOLD_S: "2.5"
+      AEB_MIN_SPEED_MPS: "1.0"
+    restart_policy: never
+
+  # ─── FCW — Forward Collision Warning ─────────────────────────────────────────
+  - id: fcw
+    path: ../src/safety/fcw/fcw_node.py
+    inputs:
+      perception_context: perception_fusion/perception_context
+    outputs:
+      - forward_collision_warning
+    env:
+      FCW_TTC_WARN_S: "4.0"
+      FCW_TTC_URGENT_S: "2.8"
+    restart_policy: never
+
+  # ─── LDW — Lane Departure Warning ────────────────────────────────────────────
+  - id: ldw
+    path: ../src/safety/ldw/ldw_node.py
+    inputs:
+      perception_context: perception_fusion/perception_context
+      vehicle_state: vehicle_bridge/vehicle_state
+    outputs:
+      - ldw_event
+    env:
+      LDW_MIN_SPEED_MPS: "8.0"
+    restart_policy: never
+
+  # ─── BSD — Blind Spot Detection (Hailo-15H GMSL2 side cameras) ───────────────
+  # Hailo-15H architecture note:
+  #   - 4 GMSL2 side cameras (side_front_L/R, side_rear_L/R)
+  #   - Requires 2× Hailo-15H chips (each chip: 2× CSI-2 inputs, max 2 cameras)
+  #   - BSD YOLO HEF runs on Hailo-15H, outputs via hailo15h_daemon
+  - id: bsd
+    path: ../src/safety/bsd/bsd_node.py
+    inputs:
+      hailo_detections: hailo15h_daemon/hailo_detections
+      vehicle_state: vehicle_bridge/vehicle_state
+    outputs:
+      - bsd_event
+    env:
+      BSD_CONFIDENCE_MIN: "0.6"
+    restart_policy: never
+
+  # ─── DMS / Face Pose Monitor (Hailo-15H, USB camera) ─────────────────────────
+  # DMS camera: USB (not GMSL2) — separate V4L2 capture path
+  # Hailo-15H processes face_pose_monitor.hef on USB camera frames
+  - id: face_pose_monitor
+    path: ../src/safety/face_pose_monitor/face_pose_monitor_node.py
+    inputs:
+      hailo_dms_output: hailo15h_daemon/hailo_dms_output
+    outputs:
+      - dms_event
+      - driver_attention
+    env:
+      DMS_DISTRACTION_THRESHOLD_S: "2.0"
+      DMS_PITCH_THRESHOLD_DEG: "20.0"
+      DMS_YAW_THRESHOLD_DEG: "30.0"
+    restart_policy: never
+
+  # ─── MRM Handler ─────────────────────────────────────────────────────────────
+  - id: mrm_handler
+    path: ../src/safety/mrm/mrm_handler_node.py
+    inputs:
+      emergency_brake: aeb/emergency_brake_request
+      system_health: health_daemon/health_status
+    outputs:
+      - mrm_command
+    restart_policy: never
+
+  # ─── MRM Emergency Stop ───────────────────────────────────────────────────────
+  - id: mrm_emergency_stop
+    path: ../src/safety/mrm/mrm_emergency_stop_node.py
+    inputs:
+      mrm_command: mrm_handler/mrm_command
+    outputs:
+      - mrm_longitudinal_cmd
+    restart_policy: never

@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-30  
 **Research Source:** arxiv paper (Feb 2026), dora-rs GitHub, dora-benchmark, dora-autoware, community discussions, GOSIM 2024 presentations  
-**Context:** Next-gen ADAS stack for ExoPilot 03+ (RK3688, LiDAR, 12 TOPS NPU)  
+**Context:** Next-gen ADAS stack for ExoPilot 03+ (RK3688, 12 TOPS RKNN NPU); Hailo-15H (20 TOPS, MIPI CSI-2) targeted for ExoPilot 05+  
 **Baseline:** Autoware.universe DORA port (patterns) + VisionPilot (ADAS logic + models)  
 **Language:** Python 3.10+ for all application nodes
 
